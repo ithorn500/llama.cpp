@@ -6,7 +6,9 @@ add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
+            mtmd-input-chunks.cpp
             mtmd.h
+            mtmd-input-chunks.h
             mtmd-helper.cpp
             mtmd-helper.h
             clip.cpp
@@ -65,6 +67,7 @@ endif()
 set(MTMD_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd.h
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-input-chunks.h
     )
 
 set_target_properties(mtmd

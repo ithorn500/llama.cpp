@@ -1,5 +1,6 @@
 #include "sampling.h"
 
+#include "grammar-cache.h"
 #include "common.h"
 #include "fit.h"
 #include "log.h"
@@ -250,13 +251,15 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
 
         if (!grammar_str.empty()) {
-             if (params.grammar_lazy) {
-                 grmr = llama_sampler_init_grammar_lazy_patterns(vocab, grammar_str.c_str(), "root",
-                         trigger_patterns_c.data(), trigger_patterns_c.size(),
-                         trigger_tokens.data(), trigger_tokens.size());
-             } else {
-                 grmr = llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root");
-             }
+            grmr = common_grammar_cache_get_sampler(
+                    vocab,
+                    grammar_str.c_str(),
+                    params.grammar_lazy,
+                    trigger_patterns_c.data(),
+                    trigger_patterns_c.size(),
+                    trigger_tokens.data(),
+                    trigger_tokens.size(),
+                    params.grammar_cache_size);
         }
     }
 

@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-tools.cpp
     server-tools.h
+    server-core.cpp
+    server-core.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -26,6 +28,11 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+# Gemma Gateway F-005 — publish transport-free core as libllama-server-core.a (path expected by
+# scripts/ci/check_server_core_link_gate.sh). Same objects as target server-context; excludes
+# server-http.cpp / server.cpp (httplib). Further extraction (dispatch API, pybind) tracks F-005.
+set_target_properties(${TARGET} PROPERTIES ARCHIVE_OUTPUT_NAME llama-server-core)
 
 
 # llama-server executable

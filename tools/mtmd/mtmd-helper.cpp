@@ -9,6 +9,7 @@
 
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-input-chunks.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -490,7 +491,17 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
             LOG_ERR("Unable to read WAV audio file from buffer\n");
             return nullptr;
         }
-        return mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data());
+        // F-006: feed decoded PCM in frames so callers share one path with streaming ingestion.
+        mtmd_audio_pcm_stream * stream = mtmd_audio_pcm_stream_new();
+        if (!stream) {
+            return nullptr;
+        }
+        constexpr size_t k_pcm_chunk = 8192;
+        for (size_t off = 0; off < pcmf32.size(); off += k_pcm_chunk) {
+            const size_t n = std::min(k_pcm_chunk, pcmf32.size() - off);
+            mtmd_input_chunks_append_audio_pcm(stream, pcmf32.data() + off, n);
+        }
+        return mtmd_audio_pcm_stream_finalize_bitmap(stream);
     }
 
     // otherwise, we assume it's an image

@@ -257,6 +257,8 @@ struct common_params_sampling {
     common_grammar              grammar;      // optional grammar constraint (user / output-format / tool-calls)
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers; // optional triggers (for lazy grammars)
+    /** <= -1: use getenv("LLAMA_GRAMMAR_CACHE_SIZE") or default 128; 0 disables fork-side LRU. */
+    int32_t                             grammar_cache_size = -1;
     std::set<llama_token>               preserved_tokens;
 
     std::vector<llama_logit_bias> logit_bias;     // logit biases to apply

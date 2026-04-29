@@ -958,6 +958,22 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // F-008: optional grammar builder selector (GBNF vs LLGuidance) for JSON-schema grammars
+    bool json_schema_force_gbnf = false;
+    {
+        const std::string ge = json_value(body, "grammar_engine", std::string());
+        if (ge == "gbnf" || ge == "grammar") {
+            json_schema_force_gbnf = true;
+        }
+        if (body.contains("response_format")) {
+            json response_format_engine = json_value(body, "response_format", json::object());
+            const std::string eng       = json_value(response_format_engine, "engine", std::string(""));
+            if (eng == "gbnf") {
+                json_schema_force_gbnf = true;
+            }
+        }
+    }
+
     // get input files
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
@@ -1035,6 +1051,7 @@ json oaicompat_chat_params_parse(
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                 = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice           = common_chat_tool_choice_parse_oaicompat(tool_choice);
+    inputs.json_schema_force_gbnf = json_schema_force_gbnf;
     inputs.json_schema           = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar               = grammar;
     inputs.use_jinja             = opt.use_jinja;

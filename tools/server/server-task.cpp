@@ -374,7 +374,10 @@ task_params server_task::params_from_json_cmpl(
         try {
             auto schema                  = json_value(data, "json_schema", json::object());
             SRV_DBG("JSON schema: %s\n", schema.dump(2).c_str());
-            std::string grammar_str      = json_schema_to_grammar(schema);
+            const bool force_gbnf =
+                    json_value(data, "grammar_engine", std::string("")) == "gbnf"
+                    || json_value(data, "grammar_engine", std::string("")) == "grammar";
+            std::string grammar_str      = json_schema_to_grammar(schema, force_gbnf);
             SRV_DBG("Converted grammar: %s\n", grammar_str.c_str());
             params.sampling.grammar      = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str)};
         } catch (const std::exception & e) {

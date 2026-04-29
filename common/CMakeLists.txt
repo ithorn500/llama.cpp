@@ -60,6 +60,10 @@ add_library(${TARGET}
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
     chat-auto-parser.h
+    grammar-cache.cpp
+    grammar-cache.h
+    grammar-sha256.c
+    grammar-sha256.h
     chat-diff-analyzer.cpp
     chat-peg-parser.cpp
     chat-peg-parser.h

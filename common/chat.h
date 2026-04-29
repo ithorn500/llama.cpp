@@ -159,6 +159,8 @@ struct common_chat_templates_inputs {
     std::vector<common_chat_msg>          messages;
     std::string                           grammar;
     std::string                           json_schema;
+    /** When true, ``json_schema_to_grammar`` uses the portable GBNF builder even if LLGuidance is compiled (F-008). */
+    bool                                  json_schema_force_gbnf = false;
     bool                                  add_generation_prompt = true;
     bool                                  use_jinja             = true;
     // Parameters below only supported when use_jinja is true

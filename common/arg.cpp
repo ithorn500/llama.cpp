@@ -1890,6 +1890,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling());
     add_opt(common_arg(
+        {"--grammar-cache-size"}, "N",
+        "LRU cap for compiled GBNF grammars in-process (0 = disable; default 128 or LLAMA_GRAMMAR_CACHE_SIZE)",
+        [](common_params & params, int value) {
+            params.sampling.grammar_cache_size = value;
+        }
+    ).set_sampling().set_env("LLAMA_GRAMMAR_CACHE_SIZE"));
+    add_opt(common_arg(
         {"-bs", "--backend-sampling"},
         "enable backend sampling (experimental) (default: disabled)",
         [](common_params & params) {
