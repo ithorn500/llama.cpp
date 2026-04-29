@@ -157,3 +157,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Gemma Gateway — fork-patch stubs (docs/llama-fork-patches.md); present on disk for CI;
+# not part of upstream llama.cpp — ignore so merges/e2e do not treat as dirty submodule noise.
+/.fork-patches/
