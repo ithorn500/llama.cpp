@@ -20,6 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef __APPLE__
@@ -761,6 +767,49 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+struct ggml_backend_sched_job_suspend_entry {
+    std::thread::id owner;
+    int             priority = 0;
+    uint64_t        seq = 0;
+    int             nest = 0;
+    int             ckpt_resume_split = -1;
+    int             ckpt_resume_node_j0 = 0;
+    bool            ckpt_skip_split_prefix = false;
+    int             cur_copy = 0;
+    int             next_copy = 0;
+};
+
+struct ggml_backend_sched_job_queue {
+    bool enabled = false;
+    int  suspend_depth = 0;
+
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    bool                in_use = false;
+    std::thread::id     owner{};
+    int                 nest = 0;
+    uint64_t            seq_counter = 0;
+    int                 owner_priority = 0;
+    uint64_t            owner_seq = 0;
+
+    bool                preempt_enabled = true;
+    std::atomic<bool>   preempt_pending{false};
+
+    std::vector<ggml_backend_sched_job_suspend_entry> suspend_stack;
+
+    struct ticket_cmp {
+        bool operator()(const std::pair<int, uint64_t> & a, const std::pair<int, uint64_t> & b) const {
+            if (a.first != b.first) {
+                return a.first > b.first; // higher priority first at begin()
+            }
+            return a.second < b.second;
+        }
+    };
+
+    std::set<std::pair<int, uint64_t>, ticket_cmp> pending;
+};
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -813,10 +862,31 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_split_poll_callback callback_split_poll;
+    void * callback_split_poll_user_data;
+
+    ggml_backend_sched_between_eval_batches_callback callback_between_eval_batches;
+    void * callback_between_eval_batches_user_data;
+
+#ifdef GGML_SCHED_CHECKPOINT_SPIKE
+    ggml_backend_sched_checkpoint_spike_callback callback_checkpoint_spike;
+    void * callback_checkpoint_spike_user_data;
+#endif
+
+    ggml_backend_sched_job_queue * jq;
+
     char * context_buffer;
     size_t context_buffer_size;
 
     bool op_offload;
+
+    /// Monotonic generation bumped on each successful `alloc_graph` — ties checkpoint blobs to one allocation epoch.
+    uint64_t compute_generation = 0;
+
+    /// §5.1.2 execution cursor (import / preempt resume). `resume_split == -1` means inactive.
+    int                ckpt_resume_split        = -1;
+    int                ckpt_resume_node_j0      = 0;
+    bool               ckpt_skip_split_prefix     = false;
 
     int debug;
 
@@ -826,6 +896,34 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+static void ggml_sched_jq_assert_held(ggml_backend_sched_t sched) {
+    if (!sched || !sched->jq || !sched->jq->enabled || sched->jq->suspend_depth > 0) {
+        return;
+    }
+    GGML_ASSERT(sched->jq->in_use && sched->jq->owner == std::this_thread::get_id());
+}
+
+static void ggml_backend_sched_ckpt_clear(ggml_backend_sched_t sched) {
+    if (!sched) {
+        return;
+    }
+    sched->ckpt_resume_split = -1;
+    sched->ckpt_resume_node_j0 = 0;
+    sched->ckpt_skip_split_prefix = false;
+}
+
+static bool ggml_backend_sched_should_yield_here(
+        ggml_backend_sched_t sched,
+        enum ggml_status     batch_cb_status) {
+    if (batch_cb_status == GGML_STATUS_SCHED_YIELDED) {
+        return true;
+    }
+    if (!sched->jq || !sched->jq->enabled || !sched->jq->preempt_enabled) {
+        return false;
+    }
+    return sched->jq->preempt_pending.load(std::memory_order_acquire);
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1538,6 +1636,41 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void ggml_backend_sched_job_queue_yield_for_preemption(
+        ggml_backend_sched_t sched,
+        int                  resume_split,
+        int                  resume_j0,
+        bool                 resume_skip_prefix) {
+    ggml_backend_sched_job_queue * jq = sched->jq;
+    GGML_ASSERT(jq && jq->enabled);
+    GGML_ASSERT(jq->in_use && jq->owner == std::this_thread::get_id());
+
+    ggml_backend_sched_job_suspend_entry e;
+    e.owner                   = jq->owner;
+    e.priority                = jq->owner_priority;
+    e.seq                     = jq->owner_seq;
+    e.nest                    = jq->nest;
+    e.ckpt_resume_split       = resume_split;
+    e.ckpt_resume_node_j0     = resume_j0;
+    e.ckpt_skip_split_prefix  = resume_skip_prefix;
+    e.cur_copy                = sched->cur_copy;
+    e.next_copy               = sched->next_copy;
+
+    std::unique_lock<std::mutex> lk(jq->mtx);
+    jq->suspend_stack.push_back(std::move(e));
+    jq->preempt_pending.store(false, std::memory_order_release);
+    jq->in_use = false;
+    jq->cv.notify_all();
+
+    const auto me = std::this_thread::get_id();
+    jq->cv.wait(lk, [&] {
+        if (jq->suspend_depth > 0) {
+            return false;
+        }
+        return jq->in_use && jq->owner == me;
+    });
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1546,10 +1679,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+    for (int split_id = (sched->ckpt_resume_split >= 0 && sched->ckpt_skip_split_prefix) ? sched->ckpt_resume_split : 0;
+            split_id < sched->n_splits;
+            split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const bool skip_split_prefix =
+            sched->ckpt_skip_split_prefix &&
+            sched->ckpt_resume_split >= 0 &&
+            split_id == sched->ckpt_resume_split;
+
+        const int j0_start = skip_split_prefix ? sched->ckpt_resume_node_j0 : 0;
+
+        if (skip_split_prefix) {
+            sched->ckpt_skip_split_prefix = false;
+            sched->ckpt_resume_split      = -1;
+            sched->ckpt_resume_node_j0    = 0;
+        }
+
+        if (!skip_split_prefix) {
+        if (sched->callback_split_poll) {
+            const enum ggml_status poll_st = sched->callback_split_poll(
+                    sched, split_id, sched->n_splits, sched->callback_split_poll_user_data);
+            if (poll_st != GGML_STATUS_SUCCESS) {
+                return poll_st;
+            }
+        }
+
+#ifdef GGML_SCHED_CHECKPOINT_SPIKE
+        if (sched->callback_checkpoint_spike) {
+            sched->callback_checkpoint_spike(
+                    sched,
+                    split_id,
+                    sched->n_splits,
+                    GGML_SCHED_CKPT_SPIKE_AFTER_SPLIT_POLL,
+                    sched->callback_checkpoint_spike_user_data);
+        }
+#endif
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1673,15 +1841,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        }
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            if (ggml_backend_sched_should_yield_here(sched, GGML_STATUS_SUCCESS) &&
+                split_id + 1 < sched->n_splits) {
+                ggml_backend_sched_job_queue_yield_for_preemption(sched, split_id + 1, 0, false);
+            }
         } else {
-            // similar to ggml_backend_compare_graph_backend
-            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+            // similar to ggml_backend_compare_graph_backend (with optional in-split preempt / checkpoint resume)
+            int j0 = j0_start;
+            while (j0 < split->graph.n_nodes) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
@@ -1705,13 +1879,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
                 ggml_backend_synchronize(split_backend);
 
+                enum ggml_status batch_poll_st = GGML_STATUS_SUCCESS;
+                if (sched->callback_between_eval_batches) {
+                    batch_poll_st = sched->callback_between_eval_batches(
+                            sched,
+                            split_id,
+                            sched->n_splits,
+                            j0,
+                            j1 + 1,
+                            sched->callback_between_eval_batches_user_data);
+                    if (batch_poll_st != GGML_STATUS_SUCCESS && batch_poll_st != GGML_STATUS_SCHED_YIELDED) {
+                        return batch_poll_st;
+                    }
+                }
+
+                if (ggml_backend_sched_should_yield_here(sched, batch_poll_st)) {
+                    const int next_j = j1 + 1;
+                    if (next_j < split->graph.n_nodes) {
+                        ggml_backend_sched_job_queue_yield_for_preemption(sched, split_id, next_j, true);
+                    }
+                }
+
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
                 }
 
-                j0 = j1;
+                j0 = j1 + 1;
+            }
+            if (sched->jq && sched->jq->enabled && sched->jq->preempt_enabled &&
+                sched->jq->preempt_pending.load(std::memory_order_acquire) &&
+                split_id + 1 < sched->n_splits) {
+                ggml_backend_sched_job_queue_yield_for_preemption(sched, split_id + 1, 0, false);
             }
         }
+
+#ifdef GGML_SCHED_CHECKPOINT_SPIKE
+        if (sched->callback_checkpoint_spike) {
+            sched->callback_checkpoint_spike(
+                    sched,
+                    split_id,
+                    sched->n_splits,
+                    GGML_SCHED_CKPT_SPIKE_AFTER_SPLIT_COMPUTE,
+                    sched->callback_checkpoint_spike_user_data);
+        }
+#endif
 
         // record the event of this copy
         if (split->n_inputs > 0) {
@@ -1721,6 +1932,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    ggml_backend_sched_ckpt_clear(sched);
+    if (sched->jq) {
+        sched->jq->preempt_pending.store(false, std::memory_order_release);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1797,6 +2012,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    delete sched->jq;
+    sched->jq = nullptr;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -1820,6 +2037,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    ggml_backend_sched_ckpt_clear(sched);
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -1863,8 +2081,11 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    ggml_sched_jq_assert_held(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+
+    ggml_backend_sched_ckpt_clear(sched);
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -1876,6 +2097,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     sched->is_alloc = true;
+    sched->compute_generation++;
 
     return true;
 }
@@ -1888,6 +2110,7 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    ggml_sched_jq_assert_held(sched);
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -1918,6 +2141,243 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_split_poll_callback(
+        ggml_backend_sched_t sched,
+        ggml_backend_sched_split_poll_callback callback,
+        void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_split_poll = callback;
+    sched->callback_split_poll_user_data = user_data;
+}
+
+#ifdef GGML_SCHED_CHECKPOINT_SPIKE
+void ggml_backend_sched_set_checkpoint_spike_callback(
+        ggml_backend_sched_t sched,
+        ggml_backend_sched_checkpoint_spike_callback callback,
+        void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_checkpoint_spike = callback;
+    sched->callback_checkpoint_spike_user_data = user_data;
+}
+#endif
+
+void ggml_backend_sched_set_between_eval_batches_callback(
+        ggml_backend_sched_t sched,
+        ggml_backend_sched_between_eval_batches_callback callback,
+        void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_between_eval_batches = callback;
+    sched->callback_between_eval_batches_user_data = user_data;
+}
+
+bool ggml_backend_sched_job_queue_get_stats(ggml_backend_sched_t sched, ggml_backend_sched_job_queue_stats * out) {
+    if (!sched || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!sched->jq) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lk(sched->jq->mtx);
+    out->enabled         = sched->jq->enabled;
+    out->suspend_depth   = sched->jq->suspend_depth;
+    out->in_use          = sched->jq->in_use;
+    out->owner_nest      = sched->jq->in_use ? sched->jq->nest : 0;
+    out->pending_waiters = sched->jq->pending.size();
+    return true;
+}
+
+void ggml_backend_sched_job_queue_enable(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    if (enable) {
+        if (!sched->jq) {
+            sched->jq = new (std::nothrow) ggml_backend_sched_job_queue();
+            if (!sched->jq) {
+                GGML_LOG_ERROR("%s: failed to allocate job queue\n", __func__);
+                return;
+            }
+        }
+        sched->jq->enabled = true;
+    } else if (sched->jq) {
+        sched->jq->enabled = false;
+    }
+}
+
+void ggml_backend_sched_job_queue_suspend(ggml_backend_sched_t sched) {
+    if (!sched || !sched->jq || !sched->jq->enabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(sched->jq->mtx);
+    sched->jq->suspend_depth++;
+}
+
+void ggml_backend_sched_job_queue_resume(ggml_backend_sched_t sched) {
+    if (!sched || !sched->jq || !sched->jq->enabled) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(sched->jq->mtx);
+    if (sched->jq->suspend_depth > 0) {
+        sched->jq->suspend_depth--;
+    }
+    sched->jq->cv.notify_all();
+}
+
+void ggml_backend_sched_job_queue_begin(ggml_backend_sched_t sched, int priority) {
+    if (!sched || !sched->jq || !sched->jq->enabled) {
+        return;
+    }
+
+    ggml_backend_sched_job_queue * jq = sched->jq;
+    std::unique_lock<std::mutex> lk(jq->mtx);
+
+    if (jq->suspend_depth > 0) {
+        return;
+    }
+
+    const std::thread::id me = std::this_thread::get_id();
+
+    if (jq->in_use && jq->owner == me) {
+        jq->nest++;
+        return;
+    }
+
+    const uint64_t my_seq = ++jq->seq_counter;
+    jq->pending.insert({ priority, my_seq });
+
+    jq->cv.wait(lk, [&] {
+        if (jq->suspend_depth > 0) {
+            return true;
+        }
+        if (!jq->in_use) {
+            const auto it = jq->pending.begin();
+            return it->first == priority && it->second == my_seq;
+        }
+        const auto hi = jq->pending.begin();
+        if (jq->preempt_enabled && hi != jq->pending.end() && hi->first > jq->owner_priority) {
+            jq->preempt_pending.store(true, std::memory_order_release);
+        }
+        return false;
+    });
+
+    jq->pending.erase({ priority, my_seq });
+
+    if (jq->suspend_depth > 0) {
+        return;
+    }
+
+    jq->in_use = true;
+    jq->owner  = me;
+    jq->nest   = 1;
+    jq->owner_priority = priority;
+    jq->owner_seq       = my_seq;
+}
+
+void ggml_backend_sched_job_queue_end(ggml_backend_sched_t sched) {
+    if (!sched || !sched->jq || !sched->jq->enabled) {
+        return;
+    }
+
+    ggml_backend_sched_job_queue * jq = sched->jq;
+    std::unique_lock<std::mutex> lk(jq->mtx);
+
+    if (jq->suspend_depth > 0) {
+        return;
+    }
+
+    const std::thread::id me = std::this_thread::get_id();
+    if (!jq->in_use || jq->owner != me) {
+        return;
+    }
+
+    jq->nest--;
+    if (jq->nest > 0) {
+        return;
+    }
+
+    if (!jq->suspend_stack.empty()) {
+        const ggml_backend_sched_job_suspend_entry top = jq->suspend_stack.back();
+        jq->suspend_stack.pop_back();
+
+        sched->ckpt_resume_split      = top.ckpt_resume_split;
+        sched->ckpt_resume_node_j0    = top.ckpt_resume_node_j0;
+        sched->ckpt_skip_split_prefix = top.ckpt_skip_split_prefix;
+        sched->cur_copy               = top.cur_copy;
+        sched->next_copy              = top.next_copy;
+
+        jq->owner          = top.owner;
+        jq->owner_priority = top.priority;
+        jq->owner_seq      = top.seq;
+        jq->nest           = top.nest;
+        jq->in_use         = true;
+        jq->cv.notify_all();
+        return;
+    }
+
+    jq->in_use = false;
+    jq->cv.notify_all();
+}
+
+size_t ggml_backend_sched_checkpoint_blob_size(void) {
+    return sizeof(struct ggml_backend_sched_checkpoint_blob_v1);
+}
+
+bool ggml_backend_sched_checkpoint_export(
+        ggml_backend_sched_t                       sched,
+        struct ggml_backend_sched_checkpoint_blob_v1 * out_blob) {
+    if (!sched || !out_blob) {
+        return false;
+    }
+    memset(out_blob, 0, sizeof(*out_blob));
+    out_blob->magic                   = GGML_BACKEND_SCHED_CHECKPOINT_MAGIC;
+    out_blob->version                 = GGML_BACKEND_SCHED_CHECKPOINT_VERSION;
+    out_blob->compute_generation      = sched->compute_generation;
+    out_blob->resume_split_id         = sched->ckpt_resume_split;
+    out_blob->resume_node_j0          = sched->ckpt_resume_node_j0;
+    out_blob->resume_skip_split_prefix = sched->ckpt_skip_split_prefix ? 1 : 0;
+    out_blob->cur_copy                = sched->cur_copy;
+    out_blob->next_copy               = sched->next_copy;
+    return true;
+}
+
+bool ggml_backend_sched_checkpoint_import(
+        ggml_backend_sched_t                             sched,
+        const struct ggml_backend_sched_checkpoint_blob_v1 * blob) {
+    if (!sched || !blob) {
+        return false;
+    }
+    if (blob->magic != GGML_BACKEND_SCHED_CHECKPOINT_MAGIC) {
+        return false;
+    }
+    if (blob->version != GGML_BACKEND_SCHED_CHECKPOINT_VERSION) {
+        return false;
+    }
+    if (blob->compute_generation != sched->compute_generation) {
+        return false;
+    }
+    sched->ckpt_resume_split       = blob->resume_split_id;
+    sched->ckpt_resume_node_j0     = blob->resume_node_j0;
+    sched->ckpt_skip_split_prefix  = blob->resume_skip_split_prefix != 0;
+    sched->cur_copy                = blob->cur_copy;
+    sched->next_copy               = blob->next_copy;
+    return true;
+}
+
+void ggml_backend_sched_checkpoint_clear(ggml_backend_sched_t sched) {
+    ggml_backend_sched_ckpt_clear(sched);
+}
+
+uint64_t ggml_backend_sched_get_compute_generation(ggml_backend_sched_t sched) {
+    return sched ? sched->compute_generation : 0;
+}
+
+void ggml_backend_sched_job_queue_preempt_enable(ggml_backend_sched_t sched, bool enable) {
+    if (!sched || !sched->jq) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(sched->jq->mtx);
+    sched->jq->preempt_enabled = enable;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

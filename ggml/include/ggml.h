@@ -360,6 +360,8 @@ extern "C" {
         GGML_STATUS_FAILED = -1,
         GGML_STATUS_SUCCESS = 0,
         GGML_STATUS_ABORTED = 1,
+        // Cooperative scheduler yield (ggml_backend_sched job-queue preempt / checkpoint resume path).
+        GGML_STATUS_SCHED_YIELDED = 2,
     };
 
     // get ggml_status name string

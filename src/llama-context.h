@@ -10,7 +10,10 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -90,6 +93,28 @@ struct llama_context {
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+
+    /// True when llama_set_abort_callback / Engine.cancel has latched cooperative abort (same predicate as decode admission gate).
+    bool cooperative_abort_pending() const {
+        return abort_callback && abort_callback(abort_callback_data);
+    }
+
+    /// [Gemma fork / Epic §5.1.2] Request cooperative stall at the next ``ggml_backend_sched`` split boundary (not mid-node).
+    void sched_split_barrier_pause();
+    /// Release split-barrier waiters (pair with ``sched_split_barrier_pause``).
+    void sched_split_barrier_resume();
+    bool sched_split_barrier_is_paused() const;
+
+    /// [F-051] Cooperative stall between node-batch computes within a split (requires ``sched_mid_graph_cooperative``).
+    void sched_mid_graph_pause();
+    void sched_mid_graph_resume();
+    bool sched_mid_graph_is_paused() const;
+
+    /// True when context params enabled ggml_backend_sched prioritized job queue (multi-thread shared scheduler).
+    bool uses_sched_job_queue() const { return cparams.sched_job_queue; }
+
+    void sched_job_queue_enter();
+    void sched_job_queue_leave();
 
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
@@ -314,6 +339,39 @@ private:
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
+
+    /// Registered with ``ggml_backend_sched_set_split_poll_callback`` — abort + optional split-barrier wait.
+    static ggml_status sched_split_poll_trampoline(
+            ggml_backend_sched_t sched,
+            int                  split_idx,
+            int                  n_splits,
+            void *               user_data);
+
+    ggml_status sched_run_split_poll_hook();
+
+    mutable std::mutex              sched_split_barrier_mtx;
+    std::condition_variable         sched_split_barrier_cv;
+    std::atomic<bool>               sched_split_barrier_hold{false};
+
+    static ggml_status sched_between_eval_batches_trampoline(
+            ggml_backend_sched_t sched,
+            int                  split_idx,
+            int                  n_splits,
+            int                  batch_j0,
+            int                  batch_j1_exclusive,
+            void *               user_data);
+
+    ggml_status sched_run_mid_graph_poll_hook();
+
+    mutable std::mutex              sched_mid_graph_mtx;
+    std::condition_variable         sched_mid_graph_cv;
+    std::atomic<bool>               sched_mid_graph_hold{false};
+
+    /// Re-register backend + ggml sched hooks after sched.reset() or abort callback change.
+    void apply_abort_hooks_to_sched();
+
+    /// Enable ggml job queue on current sched when cparams.sched_job_queue is set (after sched.reset).
+    void sched_job_queue_on_new_sched();
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 

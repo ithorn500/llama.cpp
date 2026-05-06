@@ -23,6 +23,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -7927,7 +7928,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // Default upstream: prefetch=true → MAP_POPULATE / full mmap touch — resident RSS ~= entire GGUF at once
+    // (looks like “everything loads into RAM” even without --mlock). Gemma Gateway sets LLAMA_MMAP_PREFETCH=0 on
+    // llama-server / gateway runtime to demand-page weights during GPU upload instead.
+    bool mmap_prefetch = true;
+    if (const char * ev = std::getenv("LLAMA_MMAP_PREFETCH")) {
+        if (ev[0] == '0' && ev[1] == '\0') {
+            mmap_prefetch = false;
+        } else if (std::strcmp(ev, "off") == 0 || std::strcmp(ev, "false") == 0) {
+            mmap_prefetch = false;
+        }
+    }
+    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

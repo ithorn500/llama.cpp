@@ -31,4 +31,12 @@ dispatch_response dispatch(
         const dispatch_request & req,
         const std::function<bool()> & should_stop);
 
+/** Same routing as ``dispatch``, but streaming HTTP handlers invoke ``on_chunk`` for each SSE chunk before the full
+ *  body is assembled (Veliai ``ServerCore.dispatch`` when native ``server_routes`` + Python stream callback). */
+dispatch_response dispatch_streaming(
+        server_routes & routes,
+        const dispatch_request & req,
+        const std::function<bool()> & should_stop,
+        const std::function<void(const std::string &)> & on_chunk);
+
 }  // namespace llama_server_core

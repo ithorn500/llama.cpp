@@ -50,7 +50,9 @@ static server_http_req build_http_req(const llama_server_core::dispatch_request 
             tls_should_stop};
 }
 
-static llama_server_core::dispatch_response convert(server_http_res_ptr res) {
+static llama_server_core::dispatch_response convert(
+        server_http_res_ptr res,
+        const std::function<void(const std::string &)> * stream_chunk) {
     llama_server_core::dispatch_response out;
     if (!res) {
         out.status = 404;
@@ -69,15 +71,21 @@ static llama_server_core::dispatch_response convert(server_http_res_ptr res) {
     std::string acc;
     std::string chunk;
     while (res->next(chunk)) {
+        if (stream_chunk != nullptr && !chunk.empty()) {
+            (*stream_chunk)(chunk);
+        }
         acc += chunk;
     }
     out.body = std::move(acc);
     return out;
 }
 
-static llama_server_core::dispatch_response call_handler(handler_t fn, server_http_req & req) {
+static llama_server_core::dispatch_response call_handler(
+        handler_t fn,
+        server_http_req & req,
+        const std::function<void(const std::string &)> * stream_chunk) {
     try {
-        return convert(fn(req));
+        return convert(fn(req), stream_chunk);
     } catch (const std::invalid_argument & e) {
         llama_server_core::dispatch_response r;
         r.status = 400;
@@ -105,7 +113,11 @@ static std::string upper(std::string s) {
 
 namespace llama_server_core {
 
-dispatch_response dispatch(server_routes & routes, const dispatch_request & req, const std::function<bool()> & should_stop) {
+static dispatch_response dispatch_with_chunk_sink(
+        server_routes & routes,
+        const dispatch_request & req,
+        const std::function<bool()> & should_stop,
+        const std::function<void(const std::string &)> * stream_chunk) {
     auto http_req = build_http_req(req, should_stop);
     std::string method = upper(req.method);
     std::string path = http_req.path;
@@ -113,22 +125,22 @@ dispatch_response dispatch(server_routes & routes, const dispatch_request & req,
     // --- GET ---
     if (method == "GET") {
         if (path == "/health" || path == "/v1/health") {
-            return call_handler(routes.get_health, http_req);
+            return call_handler(routes.get_health, http_req, stream_chunk);
         }
         if (path == "/metrics") {
-            return call_handler(routes.get_metrics, http_req);
+            return call_handler(routes.get_metrics, http_req, stream_chunk);
         }
         if (path == "/props") {
-            return call_handler(routes.get_props, http_req);
+            return call_handler(routes.get_props, http_req, stream_chunk);
         }
         if (path == "/models" || path == "/v1/models") {
-            return call_handler(routes.get_models, http_req);
+            return call_handler(routes.get_models, http_req, stream_chunk);
         }
         if (path == "/slots") {
-            return call_handler(routes.get_slots, http_req);
+            return call_handler(routes.get_slots, http_req, stream_chunk);
         }
         if (path == "/lora-adapters") {
-            return call_handler(routes.get_lora_adapters, http_req);
+            return call_handler(routes.get_lora_adapters, http_req, stream_chunk);
         }
         dispatch_response r;
         r.status = 404;
@@ -139,55 +151,55 @@ dispatch_response dispatch(server_routes & routes, const dispatch_request & req,
     // --- POST ---
     if (method == "POST") {
         if (path == "/props") {
-            return call_handler(routes.post_props, http_req);
+            return call_handler(routes.post_props, http_req, stream_chunk);
         }
         if (path == "/completion") {
-            return call_handler(routes.post_completions, http_req);
+            return call_handler(routes.post_completions, http_req, stream_chunk);
         }
         if (path == "/completions") {
-            return call_handler(routes.post_completions, http_req);
+            return call_handler(routes.post_completions, http_req, stream_chunk);
         }
         if (path == "/v1/completions") {
-            return call_handler(routes.post_completions_oai, http_req);
+            return call_handler(routes.post_completions_oai, http_req, stream_chunk);
         }
         if (path == "/chat/completions" || path == "/v1/chat/completions") {
-            return call_handler(routes.post_chat_completions, http_req);
+            return call_handler(routes.post_chat_completions, http_req, stream_chunk);
         }
         if (path == "/v1/responses" || path == "/responses") {
-            return call_handler(routes.post_responses_oai, http_req);
+            return call_handler(routes.post_responses_oai, http_req, stream_chunk);
         }
         if (path == "/v1/audio/transcriptions" || path == "/audio/transcriptions") {
-            return call_handler(routes.post_transcriptions_oai, http_req);
+            return call_handler(routes.post_transcriptions_oai, http_req, stream_chunk);
         }
         if (path == "/v1/messages") {
-            return call_handler(routes.post_anthropic_messages, http_req);
+            return call_handler(routes.post_anthropic_messages, http_req, stream_chunk);
         }
         if (path == "/v1/messages/count_tokens") {
-            return call_handler(routes.post_anthropic_count_tokens, http_req);
+            return call_handler(routes.post_anthropic_count_tokens, http_req, stream_chunk);
         }
         if (path == "/infill") {
-            return call_handler(routes.post_infill, http_req);
+            return call_handler(routes.post_infill, http_req, stream_chunk);
         }
         if (path == "/embedding" || path == "/embeddings") {
-            return call_handler(routes.post_embeddings, http_req);
+            return call_handler(routes.post_embeddings, http_req, stream_chunk);
         }
         if (path == "/v1/embeddings") {
-            return call_handler(routes.post_embeddings_oai, http_req);
+            return call_handler(routes.post_embeddings_oai, http_req, stream_chunk);
         }
         if (path == "/rerank" || path == "/reranking" || path == "/v1/rerank" || path == "/v1/reranking") {
-            return call_handler(routes.post_rerank, http_req);
+            return call_handler(routes.post_rerank, http_req, stream_chunk);
         }
         if (path == "/tokenize") {
-            return call_handler(routes.post_tokenize, http_req);
+            return call_handler(routes.post_tokenize, http_req, stream_chunk);
         }
         if (path == "/detokenize") {
-            return call_handler(routes.post_detokenize, http_req);
+            return call_handler(routes.post_detokenize, http_req, stream_chunk);
         }
         if (path == "/apply-template") {
-            return call_handler(routes.post_apply_template, http_req);
+            return call_handler(routes.post_apply_template, http_req, stream_chunk);
         }
         if (path == "/lora-adapters") {
-            return call_handler(routes.post_lora_adapters, http_req);
+            return call_handler(routes.post_lora_adapters, http_req, stream_chunk);
         }
 
         // POST /slots/:id_slot — mirror ``server.cpp`` registration (path param id_slot).
@@ -195,7 +207,7 @@ dispatch_response dispatch(server_routes & routes, const dispatch_request & req,
             const std::string rest = path.substr(7);
             if (!rest.empty() && rest.find('/') == std::string::npos) {
                 http_req.params["id_slot"] = rest;
-                return call_handler(routes.post_slots, http_req);
+                return call_handler(routes.post_slots, http_req, stream_chunk);
             }
         }
 
@@ -209,6 +221,21 @@ dispatch_response dispatch(server_routes & routes, const dispatch_request & req,
     r.status = 405;
     r.body = R"({"error":{"message":"method not allowed","type":"invalid_request_error","code":405}})";
     return r;
+}
+
+dispatch_response dispatch(
+        server_routes & routes,
+        const dispatch_request & req,
+        const std::function<bool()> & should_stop) {
+    return dispatch_with_chunk_sink(routes, req, should_stop, nullptr);
+}
+
+dispatch_response dispatch_streaming(
+        server_routes & routes,
+        const dispatch_request & req,
+        const std::function<bool()> & should_stop,
+        const std::function<void(const std::string &)> & on_chunk) {
+    return dispatch_with_chunk_sink(routes, req, should_stop, &on_chunk);
 }
 
 }  // namespace llama_server_core

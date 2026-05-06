@@ -222,6 +222,10 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+if (GGML_SCHED_CHECKPOINT_SPIKE)
+    target_compile_definitions(ggml-base PUBLIC GGML_SCHED_CHECKPOINT_SPIKE)
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)

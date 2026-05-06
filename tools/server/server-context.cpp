@@ -22,6 +22,7 @@
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <mutex>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -698,6 +699,12 @@ private:
 
     bool sleeping = false;
 
+    /** When non-null, serializes server_queue inference vs Gemma ``Engine`` slot decode (shared ``llama_context``). */
+    std::mutex * external_decode_mutex = nullptr;
+
+    /** True when ``model``/``ctx`` are borrowed — never unload via ``llama_init``. */
+    bool borrowed_llama_context = false;
+
     void destroy() {
         llama_init.reset();
 
@@ -729,6 +736,12 @@ private:
 
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
+        if (borrowed_llama_context) {
+            SRV_ERR(
+                    "%s: idle sleep/reload is incompatible with adopt_loaded_context — keep sleep_idle_seconds < 0\n",
+                    __func__);
+            GGML_ABORT("server sleeping incompatible with borrow-context adopt path");
+        }
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
             destroy();
@@ -741,6 +754,159 @@ private:
         sleeping = new_state;
     }
 
+    bool adopt_loaded_context(common_params & params, llama_model * model_in, llama_context * ctx_in, std::mutex * decode_mutex) {
+        if (model_in == nullptr || ctx_in == nullptr) {
+            SRV_ERR("%s: model or context is null\n", __func__);
+            return false;
+        }
+        if (model != nullptr || ctx != nullptr) {
+            SRV_ERR("%s: server context already initialized\n", __func__);
+            return false;
+        }
+
+        SRV_INF("%s: adopting existing llama context (no weight load)\n", __func__);
+
+        params_base              = params;
+        external_decode_mutex    = decode_mutex;
+        borrowed_llama_context   = true;
+        params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+        params_base.mmproj.path.clear();
+        params_base.sleep_idle_seconds = -1;
+
+        model = model_in;
+        ctx   = ctx_in;
+
+        vocab = llama_model_get_vocab(model);
+
+        n_ctx = llama_n_ctx(ctx);
+
+        add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        if (!llama_memory_can_shift(llama_get_memory(ctx))) {
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
+            }
+
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
+            }
+        }
+
+        if (llama_model_n_swa(model) == 0) {
+            if (params_base.swa_full) {
+                params_base.swa_full = false;
+                SRV_WRN("%s\n", "swa_full is not supported by this model, it will be disabled");
+            }
+        }
+
+        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
+
+        slot_prompt_similarity = params_base.slot_prompt_similarity;
+
+        SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
+
+        const int n_ctx_train = llama_model_n_ctx_train(model);
+
+        int n_ctx_slot = llama_n_ctx_seq(ctx);
+        if (n_ctx_slot > n_ctx_train) {
+            SRV_WRN(
+                    "the slot context (%d) exceeds the training context of the model (%d) - capping\n",
+                    n_ctx_slot,
+                    n_ctx_train);
+            n_ctx_slot = n_ctx_train;
+        }
+
+        slots.clear();
+
+        const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
+        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            SRV_WRN("%s", "speculative decoding not supported by this context\n");
+        }
+
+        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            SRV_WRN("%s", "speculative decoding will use checkpoints\n");
+        }
+
+        for (int i = 0; i < params_base.n_parallel; i++) {
+            slots.emplace_back();
+        }
+
+        for (int i = 0; i < params_base.n_parallel; i++) {
+            server_slot & slot = slots[i];
+
+            slot.id    = i;
+            slot.ctx   = ctx;
+            slot.n_ctx = n_ctx_slot;
+
+            slot.ctx_seq_rm_type = ctx_seq_rm_type;
+
+            slot.mctx                   = nullptr;
+            slot.prompt.tokens.has_mtmd = false;
+
+            if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
+
+                if (slot.spec) {
+                    SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+                }
+            }
+
+            SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+
+            slot.callback_on_release = [this](int id_slot) {
+                queue_tasks.pop_deferred_task(id_slot);
+            };
+
+            slot.reset();
+        }
+
+        {
+            const char * LLAMA_SERVER_SLOTS_DEBUG = getenv("LLAMA_SERVER_SLOTS_DEBUG");
+            slots_debug = LLAMA_SERVER_SLOTS_DEBUG ? atoi(LLAMA_SERVER_SLOTS_DEBUG) : 0;
+
+            if (slots_debug) {
+                SRV_WRN("slots debug = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const int32_t n_batch = llama_n_batch(ctx);
+            batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+        }
+
+        if (params_base.cache_ram_mib != 0) {
+            if (params_base.cache_ram_mib < 0) {
+                SRV_WRN("prompt cache is enabled, size limit: %s\n", "no limit");
+            } else {
+                SRV_WRN("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+            }
+            SRV_WRN("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+        } else {
+            SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+        SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        if (!params_base.model_alias.empty()) {
+            model_name = *params_base.model_alias.begin();
+        } else if (!params_base.model.name.empty()) {
+            model_name = params_base.model.name;
+        } else {
+            auto model_path = std::filesystem::path(params_base.model.path);
+            model_name      = model_path.filename().string();
+        }
+
+        model_aliases = params_base.model_alias;
+        model_tags    = params_base.model_tags;
+
+        params = params_base;
+
+        return init();
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -749,6 +915,8 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        borrowed_llama_context = false;
+        external_decode_mutex  = nullptr;
 
         llama_init = common_init_from_params(params_base);
 
@@ -980,9 +1148,17 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task) {
+            std::unique_lock<std::mutex> gx;
+            if (external_decode_mutex) {
+                gx = std::unique_lock<std::mutex>(*external_decode_mutex);
+            }
             process_single_task(std::move(task));
         });
         queue_tasks.on_update_slots([this]() {
+            std::unique_lock<std::mutex> gx;
+            if (external_decode_mutex) {
+                gx = std::unique_lock<std::mutex>(*external_decode_mutex);
+            }
             update_slots();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
@@ -2601,7 +2777,17 @@ private:
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+                        gemma_epic514_chat_overrides epic514_req {
+                            slot.task->params.gemma_engine_multimodal_prefill_backend,
+                            slot.task->params.gemma_engine_multimodal_ort_projector_path,
+                            slot.task->params.gemma_engine_multimodal_ort_projector_head,
+                        };
+                        int32_t res = input_tokens.process_chunk(
+                            ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out, &epic514_req);
+#else
                         int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+#endif
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2805,7 +2991,9 @@ private:
                         err = "Compute error.";
                     }
 
-                    // TODO: handle ret == 2 (abort) when we start aborting
+                    if (ret == 2 || ret == -3) {
+                        err = "Request aborted.";
+                    }
 
                     if (!err.empty()) {
                         SRV_ERR("%s i = %d, n_batch = %d, ret = %d\n", err.c_str(), i, n_batch, ret);
@@ -3074,6 +3262,14 @@ server_context::~server_context() = default;
 
 bool server_context::load_model(common_params & params) {
     return impl->load_model(params);
+}
+
+bool server_context::adopt_loaded_context(
+        common_params & params,
+        llama_model * model,
+        llama_context * ctx,
+        std::mutex * decode_mutex) {
+    return impl->adopt_loaded_context(params, model, ctx, decode_mutex);
 }
 
 void server_context::start_loop() {

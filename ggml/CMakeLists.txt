@@ -188,6 +188,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
+option(GGML_SCHED_CHECKPOINT_SPIKE          "ggml: F-051 design spike — checkpoint hook callbacks in ggml_backend_sched (no checkpoint state)" OFF)
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)

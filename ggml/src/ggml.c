@@ -435,6 +435,7 @@ const char * ggml_status_to_string(enum ggml_status status) {
         case GGML_STATUS_FAILED:       return "GGML status: error (operation failed)";
         case GGML_STATUS_SUCCESS:      return "GGML status: success";
         case GGML_STATUS_ABORTED:      return "GGML status: warning (operation aborted)";
+        case GGML_STATUS_SCHED_YIELDED: return "GGML status: warning (scheduler yielded for reorder)";
     }
 
     return "GGML status: unknown";

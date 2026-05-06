@@ -1,6 +1,9 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { KeyboardShortcutInfo } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
+	import { chatStore } from '$lib/stores/chat.svelte';
+	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import type { Component } from 'svelte';
 	import { SearchInput } from '$lib/components/app';
 	import { page } from '$app/state';
@@ -28,6 +31,21 @@
 		isSearchModeActive = false;
 		searchQuery = '';
 		onSearchDeactivated?.();
+	}
+
+	async function handleActionClick(event: MouseEvent, route?: string) {
+		if (route === '?new_chat=true#/') {
+			event.preventDefault();
+			await chatStore.stopGeneration();
+			conversationsStore.clearActiveConversation();
+			chatStore.clearUIState();
+			chatStore.setActiveProcessingConversation(null);
+			handleMobileSidebarItemClick();
+			await goto(route);
+			return;
+		}
+
+		handleMobileSidebarItemClick();
 	}
 
 	export function activateSearch() {
@@ -77,7 +95,7 @@
 						? 'bg-accent text-accent-foreground'
 						: ''}"
 					href={item.route}
-					onclick={handleMobileSidebarItemClick}
+					onclick={(event) => handleActionClick(event, item.route)}
 					variant="ghost"
 				>
 					<div class="flex items-center gap-2">

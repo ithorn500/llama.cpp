@@ -18,6 +18,44 @@ import type { ApiChatMessageContentPart, ApiChatCompletionToolCall } from '$lib/
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
 
+const CHAT_REQUEST_TIMEOUT_MS = 30_000;
+const CHAT_SLOTS_TIMEOUT_MS = 3_000;
+const CHAT_PREENCODE_TIMEOUT_MS = 8_000;
+
+function createTimeoutSignal(
+	externalSignal?: AbortSignal,
+	timeoutMs = CHAT_REQUEST_TIMEOUT_MS
+): {
+	signal: AbortSignal;
+	cleanup: () => void;
+	didTimeout: () => boolean;
+} {
+	const controller = new AbortController();
+	let timedOut = false;
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+	const abortFromExternal = () => controller.abort(externalSignal?.reason);
+	if (externalSignal?.aborted) {
+		abortFromExternal();
+	} else if (externalSignal) {
+		externalSignal.addEventListener('abort', abortFromExternal, { once: true });
+	}
+
+	timeoutId = setTimeout(() => {
+		timedOut = true;
+		controller.abort(new DOMException('Request timed out', 'AbortError'));
+	}, timeoutMs);
+
+	return {
+		signal: controller.signal,
+		cleanup: () => {
+			if (timeoutId) clearTimeout(timeoutId);
+			if (externalSignal) externalSignal.removeEventListener('abort', abortFromExternal);
+		},
+		didTimeout: () => timedOut
+	};
+}
+
 export class ChatService {
 	/**
 	 *
@@ -201,12 +239,13 @@ export class ChatService {
 			}
 		}
 
+		const requestTimeout = createTimeoutSignal(signal, CHAT_REQUEST_TIMEOUT_MS);
 		try {
 			const response = await fetch(`./v1/chat/completions`, {
 				method: 'POST',
 				headers: getJsonHeaders(),
 				body: JSON.stringify(requestBody),
-				signal
+				signal: requestTimeout.signal
 			});
 
 			if (!response.ok) {
@@ -245,8 +284,16 @@ export class ChatService {
 			}
 		} catch (error) {
 			if (isAbortError(error)) {
-				console.log('Chat completion request was aborted');
-				return;
+				if (signal?.aborted) {
+					console.log('Chat completion request was aborted');
+					return;
+				}
+				const timeoutError = new Error('Request timed out - the server took too long to respond');
+				timeoutError.name = 'TimeoutError';
+				if (onError) {
+					onError(timeoutError);
+				}
+				throw timeoutError;
 			}
 
 			let userFriendlyError: Error;
@@ -277,6 +324,8 @@ export class ChatService {
 			}
 
 			throw userFriendlyError;
+		} finally {
+			requestTimeout.cleanup();
 		}
 	}
 
@@ -291,15 +340,18 @@ export class ChatService {
 	 * @returns {Promise<boolean>} Promise that resolves to true if all slots are idle, false if any is processing
 	 */
 	static async areAllSlotsIdle(model?: string | null, signal?: AbortSignal): Promise<boolean> {
+		const requestTimeout = createTimeoutSignal(signal, CHAT_SLOTS_TIMEOUT_MS);
 		try {
 			const url = model ? `./slots?model=${encodeURIComponent(model)}` : './slots';
-			const res = await fetch(url, { signal });
+			const res = await fetch(url, { signal: requestTimeout.signal });
 			if (!res.ok) return true;
 
 			const slots: { is_processing: boolean }[] = await res.json();
 			return slots.every((s) => !s.is_processing);
 		} catch {
 			return true;
+		} finally {
+			requestTimeout.cleanup();
 		}
 	}
 
@@ -367,17 +419,20 @@ export class ChatService {
 			requestBody.model = model;
 		}
 
+		const requestTimeout = createTimeoutSignal(signal, CHAT_PREENCODE_TIMEOUT_MS);
 		try {
 			await fetch(`./v1/chat/completions`, {
 				method: 'POST',
 				headers: getJsonHeaders(),
 				body: JSON.stringify(requestBody),
-				signal
+				signal: requestTimeout.signal
 			});
 		} catch (error) {
 			if (!isAbortError(error)) {
 				console.warn('[ChatService] Pre-encode request failed:', error);
 			}
+		} finally {
+			requestTimeout.cleanup();
 		}
 	}
 

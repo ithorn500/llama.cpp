@@ -1,5 +1,7 @@
 import { goto } from '$app/navigation';
 import { KeyboardKey } from '$lib/enums';
+import { chatStore } from '$lib/stores/chat.svelte';
+import { conversationsStore } from '$lib/stores/conversations.svelte';
 
 interface KeyboardShortcutsCallbacks {
 	activateSearchMode?: () => void;
@@ -20,7 +22,13 @@ export function useKeyboardShortcuts(callbacks: KeyboardShortcutsCallbacks) {
 
 		if (isCtrlOrCmd && event.shiftKey && event.key === KeyboardKey.O_UPPER) {
 			event.preventDefault();
-			goto('?new_chat=true#/');
+			void (async () => {
+				await chatStore.stopGeneration();
+				conversationsStore.clearActiveConversation();
+				chatStore.clearUIState();
+				chatStore.setActiveProcessingConversation(null);
+				await goto('?new_chat=true#/');
+			})();
 		}
 
 		if (event.shiftKey && isCtrlOrCmd && event.key === KeyboardKey.E_UPPER) {

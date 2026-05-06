@@ -17,6 +17,49 @@
 #include <limits>
 #include <stdexcept>
 
+#include "ggml-backend.h"
+
+namespace {
+
+struct llama_sched_reserve_jq_suspend_guard {
+    llama_context * ctx = nullptr;
+    bool            suspended = false;
+
+    explicit llama_sched_reserve_jq_suspend_guard(llama_context * c) : ctx(c) {
+        if (ctx && ctx->uses_sched_job_queue() && ctx->get_sched()) {
+            ggml_backend_sched_job_queue_suspend(ctx->get_sched());
+            suspended = true;
+        }
+    }
+
+    void before_sched_replace() {
+        if (!ctx || !ctx->uses_sched_job_queue()) {
+            return;
+        }
+        if (suspended && ctx->get_sched()) {
+            ggml_backend_sched_job_queue_resume(ctx->get_sched());
+            suspended = false;
+        }
+    }
+
+    void after_sched_replace() {
+        if (!ctx || !ctx->uses_sched_job_queue() || !ctx->get_sched()) {
+            return;
+        }
+        ggml_backend_sched_job_queue_suspend(ctx->get_sched());
+        suspended = true;
+    }
+
+    ~llama_sched_reserve_jq_suspend_guard() {
+        if (suspended && ctx && ctx->get_sched()) {
+            ggml_backend_sched_job_queue_resume(ctx->get_sched());
+            suspended = false;
+        }
+    }
+};
+
+} // namespace
+
 //
 // llama_context
 //
@@ -64,6 +107,10 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    cparams.sched_job_queue              = params.sched_job_queue;
+    cparams.sched_job_priority           = params.sched_job_priority;
+    cparams.sched_mid_graph_cooperative  = params.sched_mid_graph_cooperative;
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -411,6 +458,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    sched_job_queue_on_new_sched();
+
+    llama_sched_reserve_jq_suspend_guard jq_suspend_guard(this);
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -563,7 +614,10 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
+                jq_suspend_guard.before_sched_replace();
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched_job_queue_on_new_sched();
+                jq_suspend_guard.after_sched_replace();
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -627,6 +681,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    apply_abort_hooks_to_sched();
 }
 
 void llama_context::synchronize() {
@@ -1014,6 +1070,149 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
     cparams.n_threads_batch = n_threads_batch;
 }
 
+void llama_context::sched_job_queue_on_new_sched() {
+    if (!sched || !cparams.sched_job_queue) {
+        return;
+    }
+
+    ggml_backend_sched_job_queue_enable(sched.get(), true);
+}
+
+void llama_context::sched_job_queue_enter() {
+    if (!sched || !cparams.sched_job_queue) {
+        return;
+    }
+
+    ggml_backend_sched_job_queue_begin(sched.get(), cparams.sched_job_priority);
+}
+
+void llama_context::sched_job_queue_leave() {
+    if (!sched || !cparams.sched_job_queue) {
+        return;
+    }
+
+    ggml_backend_sched_job_queue_end(sched.get());
+}
+
+ggml_status llama_context::sched_split_poll_trampoline(
+        ggml_backend_sched_t /*sched*/,
+        int /*split_idx*/,
+        int /*n_splits*/,
+        void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    if (!ctx) {
+        return GGML_STATUS_SUCCESS;
+    }
+    return ctx->sched_run_split_poll_hook();
+}
+
+ggml_status llama_context::sched_run_split_poll_hook() {
+    if (cooperative_abort_pending()) {
+        return GGML_STATUS_ABORTED;
+    }
+    if (!sched_split_barrier_hold.load(std::memory_order_acquire)) {
+        return GGML_STATUS_SUCCESS;
+    }
+    std::unique_lock<std::mutex> lk(sched_split_barrier_mtx);
+    while (sched_split_barrier_hold.load(std::memory_order_acquire) && !cooperative_abort_pending()) {
+        sched_split_barrier_cv.wait(lk);
+    }
+    if (cooperative_abort_pending()) {
+        return GGML_STATUS_ABORTED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+void llama_context::sched_split_barrier_pause() {
+    sched_split_barrier_hold.store(true, std::memory_order_release);
+}
+
+void llama_context::sched_split_barrier_resume() {
+    std::lock_guard<std::mutex> lk(sched_split_barrier_mtx);
+    sched_split_barrier_hold.store(false, std::memory_order_release);
+    sched_split_barrier_cv.notify_all();
+}
+
+bool llama_context::sched_split_barrier_is_paused() const {
+    return sched_split_barrier_hold.load(std::memory_order_acquire);
+}
+
+namespace {
+
+bool llama_sched_eval_cooperative_trampoline(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    const llama_cparams & cp = ctx->get_cparams();
+    if (ask) {
+        if (cp.cb_eval) {
+            return cp.cb_eval(t, true, cp.cb_eval_user_data);
+        }
+        if (cp.sched_mid_graph_cooperative) {
+            return true;
+        }
+        return false;
+    }
+    if (cp.cb_eval) {
+        return cp.cb_eval(t, false, cp.cb_eval_user_data);
+    }
+    return true;
+}
+
+} // namespace
+
+void llama_context::sched_mid_graph_pause() {
+    sched_mid_graph_hold.store(true, std::memory_order_release);
+}
+
+void llama_context::sched_mid_graph_resume() {
+    std::lock_guard<std::mutex> lk(sched_mid_graph_mtx);
+    sched_mid_graph_hold.store(false, std::memory_order_release);
+    sched_mid_graph_cv.notify_all();
+}
+
+bool llama_context::sched_mid_graph_is_paused() const {
+    return sched_mid_graph_hold.load(std::memory_order_acquire);
+}
+
+ggml_status llama_context::sched_run_mid_graph_poll_hook() {
+    if (cooperative_abort_pending()) {
+        return GGML_STATUS_ABORTED;
+    }
+    if (!sched_mid_graph_hold.load(std::memory_order_acquire)) {
+        return GGML_STATUS_SUCCESS;
+    }
+    std::unique_lock<std::mutex> lk(sched_mid_graph_mtx);
+    while (sched_mid_graph_hold.load(std::memory_order_acquire) && !cooperative_abort_pending()) {
+        sched_mid_graph_cv.wait(lk);
+    }
+    if (cooperative_abort_pending()) {
+        return GGML_STATUS_ABORTED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+ggml_status llama_context::sched_between_eval_batches_trampoline(
+        ggml_backend_sched_t /*sched*/,
+        int /*split_idx*/,
+        int /*n_splits*/,
+        int /*batch_j0*/,
+        int /*batch_j1_exclusive*/,
+        void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    return ctx->sched_run_mid_graph_poll_hook();
+}
+
+void llama_context::apply_abort_hooks_to_sched() {
+    if (!sched) {
+        return;
+    }
+
+    ggml_backend_sched_set_split_poll_callback(sched.get(), sched_split_poll_trampoline, static_cast<void *>(this));
+    ggml_backend_sched_set_between_eval_batches_callback(
+            sched.get(),
+            &llama_context::sched_between_eval_batches_trampoline,
+            static_cast<void *>(this));
+}
+
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
@@ -1029,6 +1228,8 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
             }
         }
     }
+
+    apply_abort_hooks_to_sched();
 }
 
 void llama_context::set_embeddings(bool value) {
@@ -1175,6 +1376,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    struct llama_sched_jq_guard {
+        llama_context * ctx;
+        explicit llama_sched_jq_guard(llama_context * c) : ctx(c) {
+            if (ctx->uses_sched_job_queue()) {
+                ctx->sched_job_queue_enter();
+            }
+        }
+        ~llama_sched_jq_guard() {
+            if (ctx->uses_sched_job_queue()) {
+                ctx->sched_job_queue_leave();
+            }
+        }
+    } jq_guard{ this };
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1197,7 +1412,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (cparams.cb_eval || cparams.sched_mid_graph_cooperative) {
+            ggml_backend_sched_set_eval_callback(
+                    sched.get(), llama_sched_eval_cooperative_trampoline, static_cast<void *>(this));
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1298,14 +1518,26 @@ int llama_context::encode(const llama_batch & batch_inp) {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
     cparams.causal_attn = false;
 
-    ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    ggml_status status = GGML_STATUS_SUCCESS;
+    llm_graph_result * res = nullptr;
+    int sched_yield_retries = 0;
+    do {
+        res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+        if (res || status != GGML_STATUS_SCHED_YIELDED) {
+            break;
+        }
+        ++sched_yield_retries;
+        LLAMA_LOG_WARN("%s: scheduler yielded during encoder ubatch, retrying (%d)\n", __func__, sched_yield_retries);
+    } while (sched_yield_retries < 8);
 
     cparams.causal_attn = causal_attn_org;
 
     if (!res) {
         switch (status) {
             case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_SCHED_YIELDED:
+                LLAMA_LOG_ERROR("%s: scheduler yield escaped encoder retries\n", __func__);
+                return -3;
             case GGML_STATUS_ALLOC_FAILED: return -2;
             case GGML_STATUS_FAILED:       return -3;
             case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
@@ -1669,6 +1901,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
+    // Earliest KV position written successfully in this llama_decode call, per sequence.
+    // Used to roll back all partial decode work when abort fires between micro-batches or
+    // when a later ubatch fails after earlier ubatches succeeded.
+    llama_pos decode_kv_floor[LLAMA_MAX_SEQ];
+    for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        decode_kv_floor[s] = std::numeric_limits<llama_pos>::max();
+    }
+
+    // Gemma Gateway fork — Epic §5.1.2 decode-scheduler admission gate:
+    // if the cooperative abort callback is already true, skip building/running
+    // micro-batches for this llama_decode call (same exit convention as
+    // GGML_STATUS_ABORTED below → return 2).
+    if (abort_callback && abort_callback(abort_callback_data)) {
+        return 2;
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1688,34 +1936,70 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-        ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        // Cooperative abort between micro-batches: mirror failed-ubatch cleanup — drop KV for
+        // all tokens already committed in this decode call, then exit like GGML_STATUS_ABORTED.
+        if (abort_callback && abort_callback(abort_callback_data)) {
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (decode_kv_floor[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+
+                LLAMA_LOG_WARN("%s: cooperative abort between ubatches — removing memory module entries for seq_id = %d, pos = [%d, +inf)\n",
+                        __func__, s, decode_kv_floor[s]);
+
+                memory->seq_rm(s, decode_kv_floor[s], -1);
+            }
+
+            return 2;
+        }
+
+        ggml_status status = GGML_STATUS_SUCCESS;
+        llm_graph_result * res = nullptr;
+        int sched_yield_retries = 0;
+        do {
+            res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+            if (res || status != GGML_STATUS_SCHED_YIELDED) {
+                break;
+            }
+            ++sched_yield_retries;
+            LLAMA_LOG_WARN("%s: scheduler yielded during decoder ubatch, retrying (%d)\n", __func__, sched_yield_retries);
+        } while (sched_yield_retries < 8);
 
         if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
+            // Failed/aborted ubatch: roll back KV from the earliest position touched in this
+            // decode call (prior successful ubatches merged with this ubatch's positions).
+            llama_pos cut[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
+                cut[s] = std::numeric_limits<llama_pos>::max();
             }
 
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 const auto & seq_id = ubatch.seq_id[i][0];
 
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                cut[seq_id] = std::min(cut[seq_id], ubatch.pos[i]);
             }
 
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                if (decode_kv_floor[s] != std::numeric_limits<llama_pos>::max()) {
+                    cut[s] = std::min(cut[s], decode_kv_floor[s]);
+                }
+            }
+
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (cut[s] == std::numeric_limits<llama_pos>::max()) {
                     continue;
                 }
 
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, cut[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                memory->seq_rm(s, cut[s], -1);
             }
 
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_SCHED_YIELDED:
+                    LLAMA_LOG_ERROR("%s: scheduler yield escaped decoder retries\n", __func__);
+                    return -3;
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
@@ -1743,6 +2027,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
             if (n_outputs) {
+                // Defensive clamp: batch allocator occasionally undercounts n_outputs_all for
+                // Gemma-4 31B with flash_attn, causing accumulated outputs to exceed the
+                // pre-allocated capacity. Cap rather than crash — logits for overflow tokens
+                // are lost but inference continues correctly for in-bound tokens.
+                if ((int64_t)n_outputs_prev + n_outputs > (int64_t)n_outputs_all) {
+                    LLAMA_LOG_ERROR("%s: output overflow: n_outputs_prev=%lld + n_outputs=%d > n_outputs_all=%d; clamping\n",
+                            __func__, (long long)n_outputs_prev, n_outputs, (int)n_outputs_all);
+                    n_outputs = (int32_t)n_outputs_all - (int32_t)n_outputs_prev;
+                    if (n_outputs < 0) { n_outputs = 0; }
+                }
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -1763,6 +2057,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
                         if (n_outputs) {
+                            // Same defensive clamp as logits extraction above.
+                            if ((int64_t)n_outputs_prev + n_outputs > (int64_t)n_outputs_all) {
+                                LLAMA_LOG_ERROR("%s: embd output overflow: clamping n_outputs from %d to %lld\n",
+                                        __func__, n_outputs, (long long)(n_outputs_all - n_outputs_prev));
+                                n_outputs = (int32_t)n_outputs_all - (int32_t)n_outputs_prev;
+                                if (n_outputs < 0) { n_outputs = 0; }
+                            }
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
@@ -1822,6 +2123,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const auto & seq_id = ubatch.seq_id[i][0];
+
+            decode_kv_floor[seq_id] = std::min(decode_kv_floor[seq_id], ubatch.pos[i]);
+        }
+
         n_outputs_prev += n_outputs;
     } while (mctx->next());
 
@@ -1834,7 +2141,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto & out_ids = balloc->get_out_ids();
 
-        GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
+        if (out_ids.size() != (size_t) n_outputs) {
+            const int32_t n_outputs_safe = (int32_t) std::min<size_t>(out_ids.size(), (size_t) n_outputs);
+            LLAMA_LOG_WARN("%s: output mapping mismatch (out_ids=%zu, n_outputs=%d); clamping to %d\n",
+                    __func__, out_ids.size(), n_outputs, n_outputs_safe);
+            n_outputs = n_outputs_safe;
+        }
 
         for (int64_t i = 0; i < n_outputs; ++i) {
             int64_t out_id = out_ids[i];
@@ -1847,8 +2159,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // make the outputs have the same order they had in the user-provided batch
         // note: this is mostly relevant for recurrent models atm
         if (!sorted_output && n_outputs > 1) {
-            GGML_ASSERT((size_t) n_outputs == out_ids.size());
-
             // TODO: is there something more efficient which also minimizes swaps?
             // selection sort, to minimize swaps (from https://en.wikipedia.org/wiki/Selection_sort)
             for (uint32_t i = 0; i < n_outputs - 1; ++i) {
@@ -2910,14 +3220,17 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.sched_job_priority          =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.sched_job_queue               =*/ false,
+        /*.sched_mid_graph_cooperative   =*/ false,
+        /*.samplers                      =*/ nullptr,
+        /*.n_samplers                    =*/ 0,
     };
 
     return result;
@@ -3034,6 +3347,70 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+void llama_sched_split_barrier_pause(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->sched_split_barrier_pause();
+}
+
+void llama_sched_split_barrier_resume(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->sched_split_barrier_resume();
+}
+
+bool llama_sched_split_barrier_is_paused(const llama_context * ctx) {
+    return ctx && ctx->sched_split_barrier_is_paused();
+}
+
+void llama_sched_mid_graph_pause(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->sched_mid_graph_pause();
+}
+
+void llama_sched_mid_graph_resume(llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->sched_mid_graph_resume();
+}
+
+bool llama_sched_mid_graph_is_paused(const llama_context * ctx) {
+    return ctx && ctx->sched_mid_graph_is_paused();
+}
+
+ggml_backend_sched_t llama_get_backend_sched(llama_context * ctx) {
+    return ctx ? ctx->get_sched() : nullptr;
+}
+
+bool llama_get_sched_job_queue_stats(const llama_context * ctx, llama_sched_job_queue_stats * out) {
+    if (!ctx || !out) {
+        return false;
+    }
+    std::memset(out, 0, sizeof(*out));
+    const llama_cparams & cp = ctx->get_cparams();
+    out->param_sched_job_queue = cp.sched_job_queue;
+    out->sched_job_priority    = cp.sched_job_priority;
+    ggml_backend_sched_t sched = ctx->get_sched();
+    if (!sched) {
+        return true;
+    }
+    ggml_backend_sched_job_queue_stats gs{};
+    if (!ggml_backend_sched_job_queue_get_stats(sched, &gs)) {
+        return false;
+    }
+    out->ggml_queue_enabled = gs.enabled;
+    out->suspend_depth      = gs.suspend_depth;
+    out->in_use             = gs.in_use;
+    out->owner_nest         = gs.owner_nest;
+    out->pending_waiters    = gs.pending_waiters;
+    return true;
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
@@ -3452,7 +3829,7 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
-    if (ret != 0 && ret != 1) {
+    if (ret != 0 && ret != 1 && ret != 2 && ret != -3) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 

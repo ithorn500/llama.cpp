@@ -84,6 +84,13 @@ struct task_params {
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
 
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    /// Epic §5.1.4 — optional OpenAI-json extensions (same semantics as ``Engine.mtmd_eval`` sampler dict).
+    std::string gemma_engine_multimodal_prefill_backend;
+    std::string gemma_engine_multimodal_ort_projector_path;
+    std::string gemma_engine_multimodal_ort_projector_head;
+#endif
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 

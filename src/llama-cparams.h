@@ -44,4 +44,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    bool     sched_job_queue;
+    int32_t  sched_job_priority;
+    bool     sched_mid_graph_cooperative;
 };

@@ -8,7 +8,11 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <set>
+
+struct llama_model;
+struct llama_context;
 
 struct server_context_impl; // private implementation
 
@@ -60,6 +64,14 @@ struct server_context {
     // load the model and initialize llama_context
     // returns true on success
     bool load_model(common_params & params);
+
+    /** Wire llama-server routes to an existing ``llama_model`` / ``llama_context`` (e.g. Gemma Gateway ``Engine`` slot).
+     *  Does not load weights — caller retains ownership; ``decode_mutex`` serializes server decode vs ``Engine`` decode when set.
+     *  Disables idle sleeping, multimodal init, and server speculative decode on the adopted path (MVP). */
+    bool adopt_loaded_context(common_params & params,
+                              llama_model * model,
+                              llama_context * ctx,
+                              std::mutex * decode_mutex = nullptr);
 
     // this function will block main thread until termination
     void start_loop();

@@ -363,6 +363,9 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // [Fork] Serialize ggml_backend_sched usage when multiple threads share one scheduler (priority queue between jobs).
+        int32_t sched_job_priority; // higher value is scheduled before lower when sched_job_queue is true
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
@@ -374,6 +377,11 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        bool sched_job_queue; // enable ggml_backend_sched job_queue_begin/end around decode allocations (shared-sched multi-thread)
+        // [Gemma fork / F-051] When true with default cb_eval=null: sched uses per-node subgraph batches so cooperative
+        // llama_sched_mid_graph_pause can stall between node computes within a split (performance cost vs split_barrier only).
+        bool sched_mid_graph_cooperative;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -530,6 +538,33 @@ extern "C" {
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+
+    // [Gemma fork / Epic §5.1.2] Live ggml_backend_sched job-queue snapshot (shared-sched contention).
+    typedef struct llama_sched_job_queue_stats {
+        bool    param_sched_job_queue;
+        int32_t sched_job_priority;
+        bool    ggml_queue_enabled;
+        int32_t suspend_depth;
+        bool    in_use;
+        int32_t owner_nest;
+        size_t  pending_waiters;
+    } llama_sched_job_queue_stats;
+
+    LLAMA_API bool llama_get_sched_job_queue_stats(const struct llama_context * ctx, struct llama_sched_job_queue_stats * out);
+
+    // [Gemma fork / Epic §5.1.2] Cooperative stall at the next ggml_backend_sched split boundary (see split_poll).
+    // Not mid-node / not a full cgraph checkpoint - pair pause with resume from another thread; cooperative_abort still unblocks waiters.
+    LLAMA_API void llama_sched_split_barrier_pause(struct llama_context * ctx);
+    LLAMA_API void llama_sched_split_barrier_resume(struct llama_context * ctx);
+    LLAMA_API bool llama_sched_split_barrier_is_paused(const struct llama_context * ctx);
+
+    // [Gemma fork / F-051] Cooperative stall between ggml node-batch computes within a split (requires sched_mid_graph_cooperative).
+    LLAMA_API void llama_sched_mid_graph_pause(struct llama_context * ctx);
+    LLAMA_API void llama_sched_mid_graph_resume(struct llama_context * ctx);
+    LLAMA_API bool llama_sched_mid_graph_is_paused(const struct llama_context * ctx);
+
+    // [Gemma fork / F-051] Underlying ggml_backend_sched (serialized execution cursor + job-queue preempt — see ggml-backend.h).
+    LLAMA_API struct ggml_backend_sched * llama_get_backend_sched(struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");

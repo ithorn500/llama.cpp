@@ -265,6 +265,15 @@ task_params server_task::params_from_json_cmpl(
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
 
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    params.gemma_engine_multimodal_prefill_backend =
+        json_value(data, "gemma_engine_multimodal_prefill_backend", std::string());
+    params.gemma_engine_multimodal_ort_projector_path =
+        json_value(data, "gemma_engine_multimodal_ort_projector_path", std::string());
+    params.gemma_engine_multimodal_ort_projector_head =
+        json_value(data, "gemma_engine_multimodal_ort_projector_head", std::string());
+#endif
+
     params.sampling.top_k              = json_value(data, "top_k",               defaults.sampling.top_k);
     params.sampling.top_p              = json_value(data, "top_p",               defaults.sampling.top_p);
     params.sampling.min_p              = json_value(data, "min_p",               defaults.sampling.min_p);

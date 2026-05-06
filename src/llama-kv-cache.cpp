@@ -782,6 +782,20 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            struct llama_kv_shift_jq_guard {
+                llama_context * L;
+                explicit llama_kv_shift_jq_guard(llama_context * c) : L(c) {
+                    if (L->uses_sched_job_queue()) {
+                        L->sched_job_queue_enter();
+                    }
+                }
+                ~llama_kv_shift_jq_guard() {
+                    if (L->uses_sched_job_queue()) {
+                        L->sched_job_queue_leave();
+                    }
+                }
+            } jq_guard{lctx};
+
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();

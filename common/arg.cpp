@@ -2282,6 +2282,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--list-devices"},
         "print list of available devices and exit",
         [](common_params &) {
+            // Ensure this standalone option works even in binaries that do not
+            // explicitly load backends before argument processing.
+            ggml_backend_load_all();
+
             std::vector<ggml_backend_dev_t> devices;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
@@ -2290,6 +2294,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 }
             }
             printf("Available devices:\n");
+            if (devices.empty()) {
+                printf("  (none)\n");
+            }
             for (auto * dev : devices) {
                 size_t free, total;
                 ggml_backend_dev_memory(dev, &free, &total);

@@ -184,7 +184,7 @@ describe('MCPService', () => {
 		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
 
 		const config: MCPServerConfig = {
-			url: 'http://localhost:8000/mcp',
+			url: 'http://localhost:11434/mcp',
 			transport: MCPTransportType.STREAMABLE_HTTP
 		};
 
@@ -196,7 +196,7 @@ describe('MCPService', () => {
 
 		expect(logs).toHaveLength(2);
 		expect(logs[1].message).toBe(
-			'HTTP POST http://localhost:8000/mcp failed: Failed to fetch (check CORS?)'
+			'HTTP POST http://localhost:11434/mcp failed: Failed to fetch (check CORS?)'
 		);
 	});
 

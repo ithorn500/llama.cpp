@@ -6,12 +6,21 @@
 #include "chat.h"
 #include "mtmd.h"
 
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+#include "gg_llama/epic514_server_mtmd_hook.hpp"
+#endif
+
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
 #include <string>
 #include <vector>
 #include <cinttypes>
+
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+#include <unordered_map>
+#include <utility>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -130,6 +139,12 @@ struct server_tokens {
 
 private: // disallow accessing these members directly, risking out-of-sync
 
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    // Gemma Gateway Epic §5.1.4 — decoded RGB retained for ORT vision on ``process_chunk`` (FNV chunk id → bytes).
+    std::unordered_map<std::string, std::vector<uint8_t>>           epic514_rgb_by_chunk_id;
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> epic514_nxny_by_chunk_id;
+#endif
+
     // map a **start** index in tokens to the image chunk
     // note: the order need to be in-sync with tokens
     std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
@@ -216,6 +231,16 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     // encode and decode the image chunk
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    int32_t process_chunk(
+                llama_context * ctx,
+                mtmd_context * mctx,
+                size_t idx,
+                llama_pos pos,
+                int32_t seq_id,
+                size_t & n_tokens_out,
+                const gemma_epic514_chat_overrides * epic514_req) const;
+#else
     int32_t process_chunk(
                 llama_context * ctx,
                 mtmd_context * mctx,
@@ -223,8 +248,18 @@ public:
                 llama_pos pos,
                 int32_t seq_id,
                 size_t & n_tokens_out) const;
+#endif
 
     server_tokens clone() const;
+
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    void set_epic514_rgb_snapshots(
+            std::unordered_map<std::string, std::vector<uint8_t>> &&           rgb_by_id,
+            std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> && nxny_by_id) {
+        epic514_rgb_by_chunk_id  = std::move(rgb_by_id);
+        epic514_nxny_by_chunk_id = std::move(nxny_by_id);
+    }
+#endif
 };
 
 

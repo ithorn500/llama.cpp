@@ -313,6 +313,29 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Optional poll immediately before each split of ggml_backend_sched_compute_splits (pipeline slice per backend).
+    // Enables cooperative yield / preempt checks between split barriers without relying only on per-op backend abort.
+    // Return GGML_STATUS_SUCCESS to continue; any other status stops ggml_backend_sched_graph_compute_async and is returned to the caller.
+    typedef enum ggml_status (*ggml_backend_sched_split_poll_callback)(
+            ggml_backend_sched_t sched,
+            int                    split_idx,
+            int                    n_splits,
+            void                 * user_data);
+
+#ifdef GGML_SCHED_CHECKPOINT_SPIKE
+    // F-051 design spike — optional probes at split boundaries for future checkpoint state (no state captured yet).
+    enum ggml_sched_checkpoint_spike_phase {
+        GGML_SCHED_CKPT_SPIKE_AFTER_SPLIT_POLL    = 0, // after cooperative split_poll, before input copies
+        GGML_SCHED_CKPT_SPIKE_AFTER_SPLIT_COMPUTE = 1, // after split subgraph compute, before split event record
+    };
+    typedef void (*ggml_backend_sched_checkpoint_spike_callback)(
+            ggml_backend_sched_t                      sched,
+            int                                       split_idx,
+            int                                       n_splits,
+            enum ggml_sched_checkpoint_spike_phase    phase,
+            void                                    * user_data);
+#endif
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -350,6 +373,86 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Set a callback invoked before each split during graph compute (nullptr to disable).
+    GGML_API void                 ggml_backend_sched_set_split_poll_callback(
+            ggml_backend_sched_t sched,
+            ggml_backend_sched_split_poll_callback callback,
+            void * user_data);
+
+#ifdef GGML_SCHED_CHECKPOINT_SPIKE
+    GGML_API void                 ggml_backend_sched_set_checkpoint_spike_callback(
+            ggml_backend_sched_t sched,
+            ggml_backend_sched_checkpoint_spike_callback callback,
+            void * user_data);
+#endif
+
+    // Invoked after each synchronized subgraph compute inside ggml_backend_sched_compute_splits when using
+    // the eval-callback (chunked) path — enables cooperative pause between node batches within a split (F-051).
+    // Return GGML_STATUS_SCHED_YIELDED to request an in-split job-queue yield when preempt is enabled (same constraints as internal preempt).
+    typedef enum ggml_status (*ggml_backend_sched_between_eval_batches_callback)(
+            ggml_backend_sched_t sched,
+            int                    split_idx,
+            int                    n_splits,
+            int                    batch_j0,
+            int                    batch_j1_exclusive,
+            void                 * user_data);
+    GGML_API void                 ggml_backend_sched_set_between_eval_batches_callback(
+            ggml_backend_sched_t sched,
+            ggml_backend_sched_between_eval_batches_callback callback,
+            void * user_data);
+
+    // Serialized ggml_backend_sched execution cursor for the **current** allocated graph (same process).
+    // Does **not** dump tensor weights/activations — callers must keep graph allocation stable until resume.
+    // Validated with `compute_generation` bumped on each successful `ggml_backend_sched_alloc_graph`.
+#define GGML_BACKEND_SCHED_CHECKPOINT_MAGIC 0x47475343u // 'GGSC'
+#define GGML_BACKEND_SCHED_CHECKPOINT_VERSION 1
+
+    struct ggml_backend_sched_checkpoint_blob_v1 {
+        uint32_t magic;
+        uint32_t version;
+        uint64_t compute_generation;
+        int32_t  resume_split_id;
+        int32_t  resume_node_j0;
+        int32_t  resume_skip_split_prefix; // 0 or 1
+        int32_t  cur_copy;
+        int32_t  next_copy;
+        uint32_t _reserved0;
+        uint32_t _reserved1;
+    };
+
+    GGML_API size_t ggml_backend_sched_checkpoint_blob_size(void);
+    GGML_API bool   ggml_backend_sched_checkpoint_export(
+            ggml_backend_sched_t sched,
+            struct ggml_backend_sched_checkpoint_blob_v1 * out_blob);
+    GGML_API bool   ggml_backend_sched_checkpoint_import(
+            ggml_backend_sched_t sched,
+            const struct ggml_backend_sched_checkpoint_blob_v1 * blob);
+    GGML_API void   ggml_backend_sched_checkpoint_clear(ggml_backend_sched_t sched);
+    GGML_API uint64_t ggml_backend_sched_get_compute_generation(ggml_backend_sched_t sched);
+
+    // Optional prioritized job queue for a single ggml_backend_sched: serializes alloc_graph + graph_compute_async.
+    // Higher `priority` runs before lower when multiple threads wait.
+    // When preempt is enabled (see `ggml_backend_sched_job_queue_preempt_enable`), a waiter with **strictly higher**
+    // priority sets an internal flag so the owner can cooperatively yield **between eval batches** or **between splits**
+    // (`ggml_backend_sched_compute_splits`), releasing ownership until the preempting job finishes (`job_queue_end`).
+    // Correctness requires the preempting job not to call `alloc_graph` / `reset` on the same sched while mid-job state
+    // is suspended — typical llama decode rebuilds graphs each token; treat in-split reorder as an advanced/sched-contract API.
+    // Typical pairing: job_queue_begin → alloc_graph / graph_compute_async → job_queue_end (see llama_context fork wiring).
+    struct ggml_backend_sched_job_queue_stats {
+        bool    enabled;          // job queue object exists and is enabled
+        int32_t suspend_depth;    // >0 while sched_reserve / similar bypasses the queue
+        bool    in_use;           // a thread holds the sched (graph running)
+        int32_t owner_nest;       // nested job_queue_begin depth for the owner thread
+        size_t  pending_waiters;  // threads waiting in job_queue_begin (incl. not-yet-woken)
+    };
+    GGML_API bool                 ggml_backend_sched_job_queue_get_stats(ggml_backend_sched_t sched, struct ggml_backend_sched_job_queue_stats * out);
+    GGML_API void                 ggml_backend_sched_job_queue_enable(ggml_backend_sched_t sched, bool enable);
+    GGML_API void                 ggml_backend_sched_job_queue_suspend(ggml_backend_sched_t sched); // bypass assertions during sched_reserve
+    GGML_API void                 ggml_backend_sched_job_queue_resume(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_job_queue_begin(ggml_backend_sched_t sched, int priority);
+    GGML_API void                 ggml_backend_sched_job_queue_end(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_job_queue_preempt_enable(ggml_backend_sched_t sched, bool enable);
 
     //
     // Meta backend

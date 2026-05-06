@@ -9,6 +9,11 @@
 
 #include "server-common.h"
 
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+#include <unordered_map>
+#include <utility>
+#endif
+
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -382,11 +387,19 @@ void server_tokens::push_back(server_tokens & tokens) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
         GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
+        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ++it) {
             auto * chunk = tokens.map_idx_to_media[it->first].get();
             mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
             map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
         }
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+        for (const auto & kv : tokens.epic514_rgb_by_chunk_id) {
+            epic514_rgb_by_chunk_id[kv.first] = kv.second;
+        }
+        for (const auto & kv : tokens.epic514_nxny_by_chunk_id) {
+            epic514_nxny_by_chunk_id[kv.first] = kv.second;
+        }
+#endif
     }
 }
 
@@ -531,20 +544,68 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
     return true;
 }
 
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
 int32_t server_tokens::process_chunk(
             llama_context * ctx,
             mtmd_context * mctx,
             size_t idx,
             llama_pos pos,
             int32_t seq_id,
-            size_t & n_tokens_out) const {
+            size_t & n_tokens_out,
+            const gemma_epic514_chat_overrides * epic514_req) const
+#else
+int32_t server_tokens::process_chunk(
+            llama_context * ctx,
+            mtmd_context * mctx,
+            size_t idx,
+            llama_pos pos,
+            int32_t seq_id,
+            size_t & n_tokens_out) const
+#endif
+{
     const auto & chunk = find_chunk(idx);
     const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
                         ? "image" : "audio";
     SRV_INF("processing %s...\n", name);
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
-    llama_pos new_n_past; // unused for now
+    llama_pos new_n_past = pos;
+
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    if (mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        const char * cid = mtmd_input_chunk_get_id(chunk.get());
+        if (cid) {
+            const std::string                         id_s(cid);
+            const auto                                  rgb_it = epic514_rgb_by_chunk_id.find(id_s);
+            const auto                                  dim_it = epic514_nxny_by_chunk_id.find(id_s);
+            if (rgb_it != epic514_rgb_by_chunk_id.end() && dim_it != epic514_nxny_by_chunk_id.end()) {
+                const int hook_rc = gg::engine::gemma_epic514_server_try_process_image_chunk(
+                    mctx,
+                    ctx,
+                    chunk.get(),
+                    rgb_it->second.data(),
+                    dim_it->second.first,
+                    dim_it->second.second,
+                    pos,
+                    seq_id,
+                    n_batch,
+                    &new_n_past,
+                    epic514_req);
+                if (hook_rc < 0) {
+                    LOG_ERR("gemma_epic514_server_try_process_image_chunk failed with status %d", hook_rc);
+                    n_tokens_out = 0;
+                    return hook_rc;
+                }
+                if (hook_rc == 1) {
+                    SRV_INF("%s processed (Epic514 ORT) in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
+                    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+                    return 0;
+                }
+            }
+        }
+    }
+#endif
+
     int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
         chunk.get(),
         pos,
@@ -571,6 +632,10 @@ server_tokens server_tokens::clone() const {
         const mtmd::input_chunk_ptr & chunk = it->second;
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
     }
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    res.epic514_rgb_by_chunk_id  = epic514_rgb_by_chunk_id;
+    res.epic514_nxny_by_chunk_id = epic514_nxny_by_chunk_id;
+#endif
     return res;
 }
 
@@ -715,6 +780,10 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
 
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
     mtmd::bitmaps bitmaps;
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    std::unordered_map<std::string, std::vector<uint8_t>>           rgb_by_id;
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> nxny_by_id;
+#endif
     for (auto & file : files) {
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
         if (!bmp.ptr) {
@@ -723,6 +792,14 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
         // calculate bitmap hash (for KV caching)
         std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
         bmp.set_id(hash.c_str());
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+        {
+            const uint32_t nx = bmp.nx();
+            const uint32_t ny = bmp.ny();
+            rgb_by_id[hash].assign(bmp.data(), bmp.data() + bmp.n_bytes());
+            nxny_by_id[hash] = {nx, ny};
+        }
+#endif
         bitmaps.entries.push_back(std::move(bmp));
     }
     // process prompt
@@ -744,6 +821,9 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
         throw std::runtime_error("Failed to tokenize prompt");
     }
     auto result = server_tokens(chunks, true);
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    result.set_epic514_rgb_snapshots(std::move(rgb_by_id), std::move(nxny_by_id));
+#endif
     return result;
 }
 
