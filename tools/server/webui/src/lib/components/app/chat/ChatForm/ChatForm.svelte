@@ -51,6 +51,11 @@
 		class?: string;
 		disabled?: boolean;
 		isLoading?: boolean;
+		memoryNamespace?: string;
+		memoryProfile?: string;
+		memoryProfiles?: string[];
+		memorySpace?: string;
+		memorySpaces?: string[];
 		placeholder?: string;
 		showMcpPromptButton?: boolean;
 		showAddButton?: boolean;
@@ -60,6 +65,8 @@
 		onAttachmentRemove?: (index: number) => void;
 		onFilesAdd?: (files: File[]) => void;
 		onStop?: () => void;
+		onMemoryProfileAdd?: (profile: string) => void;
+		onMemorySpaceAdd?: (space: string) => void;
 		onSubmit?: () => void;
 		onSystemPromptClick?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
 		onUploadedFileRemove?: (fileId: string) => void;
@@ -72,6 +79,11 @@
 		class: className = '',
 		disabled = false,
 		isLoading = false,
+		memoryNamespace = '',
+		memoryProfile = $bindable('Iain'),
+		memoryProfiles = [],
+		memorySpace = $bindable('personal'),
+		memorySpaces = [],
 		placeholder = 'Type a message...',
 		showMcpPromptButton = false,
 		showAddButton = true,
@@ -81,6 +93,8 @@
 		onAttachmentRemove,
 		onFilesAdd,
 		onStop,
+		onMemoryProfileAdd,
+		onMemorySpaceAdd,
 		onSubmit,
 		onSystemPromptClick,
 		onUploadedFileRemove,
@@ -544,6 +558,13 @@
 				{isRecording}
 				{showAddButton}
 				{showModelSelector}
+				{memoryNamespace}
+				{memoryProfiles}
+				{memorySpaces}
+				bind:memoryProfile
+				bind:memorySpace
+				{onMemoryProfileAdd}
+				{onMemorySpaceAdd}
 				{uploadedFiles}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}

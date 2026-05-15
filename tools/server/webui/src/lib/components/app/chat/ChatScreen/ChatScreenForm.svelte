@@ -10,10 +10,17 @@
 		disabled?: boolean;
 		initialMessage?: string;
 		isLoading?: boolean;
+		memoryNamespace?: string;
+		memoryProfile?: string;
+		memoryProfiles?: string[];
+		memorySpace?: string;
+		memorySpaces?: string[];
 		onFileRemove?: (fileId: string) => void;
 		onFileUpload?: (files: File[]) => void;
 		onSend?: (message: string, files?: ChatUploadedFile[]) => Promise<boolean>;
 		onStop?: () => void;
+		onMemoryProfileAdd?: (profile: string) => void;
+		onMemorySpaceAdd?: (space: string) => void;
 		onSystemPromptAdd?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
 		uploadedFiles?: ChatUploadedFile[];
 	}
@@ -23,10 +30,17 @@
 		disabled = false,
 		initialMessage = '',
 		isLoading = false,
+		memoryNamespace = '',
+		memoryProfile = $bindable('Iain'),
+		memoryProfiles = [],
+		memorySpace = $bindable('personal'),
+		memorySpaces = [],
 		onFileRemove,
 		onFileUpload,
 		onSend,
 		onStop,
+		onMemoryProfileAdd,
+		onMemorySpaceAdd,
 		onSystemPromptAdd,
 		uploadedFiles = $bindable([])
 	}: Props = $props();
@@ -116,6 +130,13 @@
 		class={className}
 		{disabled}
 		{isLoading}
+		{memoryNamespace}
+		{memoryProfiles}
+		{memorySpaces}
+		bind:memoryProfile
+		bind:memorySpace
+		{onMemoryProfileAdd}
+		{onMemorySpaceAdd}
 		showMcpPromptButton
 		onFilesAdd={handleFilesAdd}
 		{onStop}

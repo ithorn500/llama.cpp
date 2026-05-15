@@ -29,6 +29,7 @@ export const SETTINGS_KEYS = {
 	FULL_HEIGHT_CODE_BLOCKS: 'fullHeightCodeBlocks',
 	SHOW_RAW_MODEL_NAMES: 'showRawModelNames',
 	SHOW_SYSTEM_MESSAGE: 'showSystemMessage',
+	DISABLE_AIGATEWAY_MEMORY: 'disableAIGatewayMemory',
 	// Sampling
 	TEMPERATURE: 'temperature',
 	DYNATEMP_RANGE: 'dynatemp_range',

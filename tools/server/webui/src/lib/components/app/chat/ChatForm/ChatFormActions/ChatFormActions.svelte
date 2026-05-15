@@ -24,8 +24,16 @@
 		isRecording?: boolean;
 		showAddButton?: boolean;
 		showModelSelector?: boolean;
+		memoryNamespace?: string;
+		memoryProfile?: string;
+		memoryProfiles?: string[];
+		memorySpace?: string;
+		memorySpaces?: string[];
+		hasText?: boolean;
 		uploadedFiles?: ChatUploadedFile[];
 		onFileUpload?: () => void;
+		onMemoryProfileAdd?: (profile: string) => void;
+		onMemorySpaceAdd?: (space: string) => void;
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
@@ -42,8 +50,16 @@
 		isRecording = false,
 		showAddButton = true,
 		showModelSelector = true,
+		memoryNamespace = '',
+		memoryProfile = $bindable('Iain'),
+		memoryProfiles = [],
+		memorySpace = $bindable('personal'),
+		memorySpaces = [],
+		hasText = false,
 		uploadedFiles = [],
 		onFileUpload,
+		onMemoryProfileAdd,
+		onMemorySpaceAdd,
 		onMicClick,
 		onStop,
 		onSystemPromptClick,
@@ -83,6 +99,34 @@
 	export function openModelSelector() {
 		selectorModelRef?.open();
 	}
+
+	function handleProfileSelect(event: Event) {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value !== '__add_new__') {
+			memoryProfile = value;
+			return;
+		}
+		const next = window.prompt('Add profile');
+		if (next?.trim()) {
+			onMemoryProfileAdd?.(next);
+		} else {
+			memoryProfile = memoryProfiles[0] || 'Iain';
+		}
+	}
+
+	function handleSpaceSelect(event: Event) {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value !== '__add_new__') {
+			memorySpace = value;
+			return;
+		}
+		const next = window.prompt('Add space');
+		if (next?.trim()) {
+			onMemorySpaceAdd?.(next);
+		} else {
+			memorySpace = memorySpaces[0] || 'personal';
+		}
+	}
 </script>
 
 <div
@@ -106,19 +150,50 @@
 		</div>
 	{/if}
 
-	{#if showModelSelector}
-		<ChatFormActionModels
-			{disabled}
-			bind:this={selectorModelRef}
-			bind:hasAudioModality
-			bind:hasVisionModality
-			bind:hasModelSelected
-			bind:isSelectedModelInCache
-			bind:submitTooltip
-			forceForegroundText
-			useGlobalSelection
-		/>
-	{/if}
+	<div class="ml-auto flex items-center gap-2">
+		<div
+			class="hidden min-w-0 items-center gap-1 rounded-lg bg-muted/45 px-2 py-1 shadow-sm ring-1 ring-border/60 sm:flex"
+			title={memoryNamespace}
+		>
+			<span class="text-[10px] font-medium uppercase tracking-normal text-muted-foreground">mem</span>
+			<select
+				bind:value={memoryProfile}
+				onchange={handleProfileSelect}
+				aria-label="Memory profile"
+				class="h-6 w-24 rounded-md border border-transparent bg-background/80 px-2 text-xs text-foreground outline-none focus:border-ring"
+			>
+				{#each memoryProfiles as profile}
+					<option value={profile}>{profile}</option>
+				{/each}
+				<option value="__add_new__">Add new...</option>
+			</select>
+			<span class="text-xs text-muted-foreground">/</span>
+			<select
+				bind:value={memorySpace}
+				onchange={handleSpaceSelect}
+				aria-label="Userspace"
+				class="h-6 w-24 rounded-md border border-transparent bg-background/80 px-2 text-xs text-foreground outline-none focus:border-ring"
+			>
+				{#each memorySpaces as space}
+					<option value={space}>{space}</option>
+				{/each}
+				<option value="__add_new__">Add new...</option>
+			</select>
+		</div>
+		{#if showModelSelector}
+			<ChatFormActionModels
+				{disabled}
+				bind:this={selectorModelRef}
+				bind:hasAudioModality
+				bind:hasVisionModality
+				bind:hasModelSelected
+				bind:isSelectedModelInCache
+				bind:submitTooltip
+				forceForegroundText
+				useGlobalSelection
+			/>
+		{/if}
+	</div>
 
 	{#if isLoading && !canSubmit}
 		<Button

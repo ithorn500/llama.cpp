@@ -23,14 +23,53 @@ import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } f
 import { modelsStore } from '$lib/stores/models.svelte';
 
 const CHAT_REQUEST_TIMEOUT_MS = 30_000;
+const CHAT_STREAM_IDLE_TIMEOUT_MS = 10 * 60_000;
 const CHAT_SLOTS_TIMEOUT_MS = 3_000;
 const CHAT_PREENCODE_TIMEOUT_MS = 8_000;
+const MEMORY_PROFILE_KEY = 'aigateway.memory.profile';
+const MEMORY_SPACE_KEY = 'aigateway.memory.space';
+const SETTINGS_CONFIG_KEY = 'LlamaCppWebui.config';
+
+function cleanMemoryPart(value: string | null | undefined, fallback: string): string {
+	const cleaned = String(value || fallback)
+		.trim()
+		.replace(/\s+/g, '-')
+		.replace(/[^a-zA-Z0-9:_./-]/g, '')
+		.slice(0, 96);
+	return cleaned || fallback;
+}
+
+function memoriesDisabledBySettings(): boolean {
+	try {
+		const raw = localStorage.getItem(SETTINGS_CONFIG_KEY);
+		const config = raw ? JSON.parse(raw) : {};
+		return config?.disableAIGatewayMemory === true;
+	} catch {
+		return false;
+	}
+}
+
+function getAIGatewayMemoryParams(): Record<string, string> | null {
+	if (typeof globalThis.localStorage === 'undefined') return null;
+	if (memoriesDisabledBySettings()) return null;
+	const profile = cleanMemoryPart(localStorage.getItem(MEMORY_PROFILE_KEY), 'Iain');
+	const space = cleanMemoryPart(localStorage.getItem(MEMORY_SPACE_KEY), 'personal');
+	const namespace = `profile:${profile}/${space}`;
+	return {
+		memory_namespace: namespace,
+		namespace,
+		memory_profile: profile,
+		memory_userspace: space,
+		memory_tier: 'medium'
+	};
+}
 
 function createTimeoutSignal(
 	externalSignal?: AbortSignal,
 	timeoutMs = CHAT_REQUEST_TIMEOUT_MS
 ): {
 	signal: AbortSignal;
+	reset: () => void;
 	cleanup: () => void;
 	didTimeout: () => boolean;
 } {
@@ -45,13 +84,21 @@ function createTimeoutSignal(
 		externalSignal.addEventListener('abort', abortFromExternal, { once: true });
 	}
 
-	timeoutId = setTimeout(() => {
-		timedOut = true;
-		controller.abort(new DOMException('Request timed out', 'AbortError'));
-	}, timeoutMs);
+	const armTimeout = () => {
+		if (timeoutId) clearTimeout(timeoutId);
+		timeoutId = setTimeout(() => {
+			timedOut = true;
+			controller.abort(new DOMException('Request timed out', 'AbortError'));
+		}, timeoutMs);
+	};
+
+	armTimeout();
 
 	return {
 		signal: controller.signal,
+		reset: () => {
+			if (!controller.signal.aborted) armTimeout();
+		},
 		cleanup: () => {
 			if (timeoutId) clearTimeout(timeoutId);
 			if (externalSignal) externalSignal.removeEventListener('abort', abortFromExternal);
@@ -297,7 +344,20 @@ export class ChatService {
 			}
 		}
 
-		const requestTimeout = createTimeoutSignal(signal, CHAT_REQUEST_TIMEOUT_MS);
+		const memoryParams = getAIGatewayMemoryParams();
+		if (memoryParams) {
+			const writableRequestBody = requestBody as Record<string, unknown>;
+			writableRequestBody.memory_namespace ??= memoryParams.memory_namespace;
+			writableRequestBody.namespace ??= memoryParams.namespace;
+			writableRequestBody.memory_profile ??= memoryParams.memory_profile;
+			writableRequestBody.memory_userspace ??= memoryParams.memory_userspace;
+			writableRequestBody.memory_tier ??= memoryParams.memory_tier;
+		}
+
+		const requestTimeout = createTimeoutSignal(
+			signal,
+			stream ? CHAT_STREAM_IDLE_TIMEOUT_MS : CHAT_REQUEST_TIMEOUT_MS
+		);
 		try {
 			const response = await fetch(`./v1/chat/completions`, {
 				method: 'POST',
@@ -327,7 +387,8 @@ export class ChatService {
 					onModel,
 					onTimings,
 					conversationId,
-					signal
+					signal,
+					requestTimeout.reset
 				);
 
 				return;
@@ -528,7 +589,8 @@ export class ChatService {
 		onModel?: (model: string) => void,
 		onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void,
 		conversationId?: string,
-		abortSignal?: AbortSignal
+		abortSignal?: AbortSignal,
+		resetRequestTimeout?: () => void
 	): Promise<void> {
 		const reader = response.body?.getReader();
 
@@ -596,6 +658,7 @@ export class ChatService {
 				if (done) break;
 
 				if (abortSignal?.aborted) break;
+				resetRequestTimeout?.();
 
 				chunk += decoder.decode(value, { stream: true });
 				const lines = chunk.split('\n');
