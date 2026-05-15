@@ -7,11 +7,11 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { afterNavigate, replaceState } from '$app/navigation';
-	import { APP_NAME } from '$lib/constants';
+	import { APP_NAME, NEW_CHAT_PARAM } from '$lib/constants';
 
 	let qParam = $derived(page.url.searchParams.get('q'));
 	let modelParam = $derived(page.url.searchParams.get('model'));
-	let newChatParam = $derived(page.url.searchParams.get('new_chat'));
+	let newChatParam = $derived(page.url.searchParams.get(NEW_CHAT_PARAM));
 
 	// Dialog state for model not available error
 	let showModelNotAvailable = $state(false);
@@ -25,7 +25,8 @@
 		const url = new URL(u.href);
 		url.searchParams.delete('q');
 		url.searchParams.delete('model');
-		url.searchParams.delete('new_chat');
+		url.searchParams.delete(NEW_CHAT_PARAM);
+
 		replaceState(url.toString(), {});
 	}
 
@@ -112,12 +113,12 @@
 		if (type === 'enter') return;
 		if (!to) return;
 		const sp = to.url.searchParams;
-		if (sp.get('new_chat') !== 'true' && sp.get('q') === null && sp.get('model') === null) {
+		if (sp.get(NEW_CHAT_PARAM) !== 'true' && sp.get('q') === null && sp.get('model') === null) {
 			return;
 		}
 		if (!isConversationsInitialized()) return;
 
-		if (sp.get('new_chat') === 'true' && hashHasNamedChat(to.url)) {
+		if (sp.get(NEW_CHAT_PARAM) === 'true' && hashHasNamedChat(to.url)) {
 			clearUrlParamsFrom(to.url);
 			return;
 		}
