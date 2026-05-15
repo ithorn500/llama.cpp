@@ -737,7 +737,7 @@ private:
             SRV_ERR("%s: model or context is null\n", __func__);
             return false;
         }
-        if (model != nullptr || ctx != nullptr) {
+        if (model_tgt != nullptr || ctx_tgt != nullptr) {
             SRV_ERR("%s: server context already initialized\n", __func__);
             return false;
         }
@@ -747,20 +747,24 @@ private:
         params_base              = params;
         external_decode_mutex    = decode_mutex;
         borrowed_llama_context   = true;
-        params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+        params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
         params_base.mmproj.path.clear();
         params_base.sleep_idle_seconds = -1;
 
-        model = model_in;
-        ctx   = ctx_in;
+        model_tgt = model_in;
+        ctx_tgt   = ctx_in;
+        model_dft.reset();
+        ctx_dft.reset();
+        spec.reset();
+        mctx = nullptr;
 
-        vocab = llama_model_get_vocab(model);
+        vocab = llama_model_get_vocab(model_tgt);
 
-        n_ctx = llama_n_ctx(ctx);
+        n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (!llama_memory_can_shift(llama_get_memory(ctx))) {
+        if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
@@ -772,22 +776,22 @@ private:
             }
         }
 
-        if (llama_model_n_swa(model) == 0) {
+        if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
                 SRV_WRN("%s\n", "swa_full is not supported by this model, it will be disabled");
             }
         }
 
-        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
+        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
 
-        const int n_ctx_train = llama_model_n_ctx_train(model);
+        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
-        int n_ctx_slot = llama_n_ctx_seq(ctx);
+        int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN(
                     "the slot context (%d) exceeds the training context of the model (%d) - capping\n",
@@ -798,12 +802,13 @@ private:
 
         slots.clear();
 
-        const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
-        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
-        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
         }
 
@@ -814,22 +819,14 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
-            slot.id    = i;
-            slot.ctx   = ctx;
-            slot.n_ctx = n_ctx_slot;
-
-            slot.ctx_seq_rm_type = ctx_seq_rm_type;
+            slot.id      = i;
+            slot.ctx_tgt = ctx_tgt;
+            slot.ctx_dft = nullptr;
+            slot.spec    = nullptr;
+            slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = nullptr;
             slot.prompt.tokens.has_mtmd = false;
-
-            if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
-
-                if (slot.spec) {
-                    SLT_INF(slot, "%s", "speculative decoding context initialized\n");
-                }
-            }
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -850,7 +847,7 @@ private:
         }
 
         {
-            const int32_t n_batch = llama_n_batch(ctx);
+            const int32_t n_batch = llama_n_batch(ctx_tgt);
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
         }
 
