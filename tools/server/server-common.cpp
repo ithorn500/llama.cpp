@@ -17,6 +17,7 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <cstdlib>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -602,6 +603,17 @@ int32_t server_tokens::process_chunk(
                     return 0;
                 }
             }
+        }
+    }
+#endif
+
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+    if (mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        const char * ext = std::getenv("GEMMA_ENGINE_MMPROJ_EXTERNAL_DEVICE");
+        if (ext && std::string(ext) == "npu") {
+            LOG_ERR("NPU mmproj hook did not process image chunk; refusing CPU/GPU fallback");
+            n_tokens_out = 0;
+            return -514;
         }
     }
 #endif

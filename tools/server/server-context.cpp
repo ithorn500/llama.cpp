@@ -959,6 +959,7 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.media_marker     = get_media_marker();
+            mparams.external_device  = params_base.mmproj_device.empty() ? nullptr : params_base.mmproj_device.c_str();
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
@@ -1205,14 +1206,23 @@ private:
             const bool enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
             SRV_INF("%s: chat template, thinking = %d\n", __func__, enable_thinking);
 
+            const bool external_mmproj_device =
+                mctx != nullptr &&
+                !params_base.mmproj.path.empty() &&
+                !params_base.mmproj_device.empty();
+            const bool allow_image =
+                mctx ? (mtmd_support_vision(mctx) || external_mmproj_device) : false;
+            const bool allow_audio =
+                mctx ? mtmd_support_audio(mctx) : false;
+
             chat_params = {
                 /* use_jinja             */ params_base.use_jinja,
                 /* prefill_assistant     */ params_base.prefill_assistant,
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
-                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+                /* allow_image           */ allow_image,
+                /* allow_audio           */ allow_audio,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -2876,6 +2886,8 @@ private:
 
                     bool has_mtmd = false;
 
+                    bool slot_released_after_mtmd_error = false;
+
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
@@ -2895,16 +2907,26 @@ private:
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
-                            continue;
+                            slot_released_after_mtmd_error = true;
+                            break;
                         }
 
                         if (ctx_dft) {
                             // TODO: in the future, figure out how to infuse target embeddings to the images
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
+#if defined(GG_GATEWAY_EPIC514_SERVER_MTMD) && GG_GATEWAY_EPIC514_SERVER_MTMD
+                            res = input_tokens.process_chunk(
+                                ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out, &epic514_req);
+#else
                             res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+#endif
                             if (res != 0) {
-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
+                                SLT_ERR(slot, "failed to process image on draft context, res = %d\n", res);
+                                send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
+                                slot.release();
+                                slot_released_after_mtmd_error = true;
+                                break;
                             }
                         }
 
@@ -2917,6 +2939,9 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+                    if (slot_released_after_mtmd_error) {
+                        continue;
                     }
 
                     // add prompt tokens for processing in the current batch

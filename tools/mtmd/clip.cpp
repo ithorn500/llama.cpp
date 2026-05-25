@@ -159,16 +159,22 @@ struct clip_ctx {
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
+    bool external_projector = false;
 
     bool debug_output_embeddings = false;
 
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
+        external_projector = ctx_params.external_device != nullptr && ctx_params.external_device[0] != '\0';
+        debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
+        if (external_projector) {
+            LOG_INF("%s: CLIP projector execution delegated to external %s backend; lane keeps metadata/preprocess only\n",
+                    __func__, ctx_params.external_device);
+        } else if (ctx_params.use_gpu) {
             auto * backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
@@ -208,8 +214,6 @@ struct clip_ctx {
         if (ctx_params.cb_eval != nullptr) {
             ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
         }
-
-        debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
     ~clip_ctx() {
@@ -2892,12 +2896,15 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
     try {
         clip_model_loader loader(fname);
         bool skip_audio = false;
+        const bool external_projector = ctx_params.external_device != nullptr && ctx_params.external_device[0] != '\0';
 
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
-            loader.load_tensors(*ctx_vision);
-            if (ctx_params.warmup) {
+            if (!external_projector) {
+                loader.load_tensors(*ctx_vision);
+            }
+            if (!external_projector && ctx_params.warmup) {
                 loader.warmup(*ctx_vision);
             }
 
@@ -2909,8 +2916,10 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         if (loader.has_audio && !skip_audio) {
             ctx_audio = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
-            loader.load_tensors(*ctx_audio);
-            if (ctx_params.warmup) {
+            if (!external_projector) {
+                loader.load_tensors(*ctx_audio);
+            }
+            if (!external_projector && ctx_params.warmup) {
                 loader.warmup(*ctx_audio);
             }
         }
@@ -4217,8 +4226,14 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_model_proj->ne[1];
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
+            if (!ctx->model.mm_input_proj_w) {
+                return ctx->model.hparams.projection_dim;
+            }
             return ctx->model.mm_input_proj_w->ne[0];
         case PROJECTOR_TYPE_GEMMA4V:
+            if (!ctx->model.mm_input_proj_w) {
+                return ctx->model.hparams.projection_dim;
+            }
             return ctx->model.mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
             return ctx->model.mm_fc_w->ne[1];

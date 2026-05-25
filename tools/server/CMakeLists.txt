@@ -27,7 +27,32 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+set(GG_GATEWAY_ROOT /opt/AIGateway CACHE PATH "Gemma Gateway repo root for Epic514 server hook")
+set(GG_GATEWAY_ORT_DIR "${GG_GATEWAY_ROOT}/vendor/ryzen-ai-ort-1.23" CACHE PATH "ONNX Runtime headers+lib for Epic514 NPU projector")
+find_library(GG_GATEWAY_ONNXRUNTIME_LIB onnxruntime PATHS "${GG_GATEWAY_ORT_DIR}/lib" NO_DEFAULT_PATH)
+find_package(OpenMP COMPONENTS CXX QUIET)
+target_compile_definitions(${TARGET} PRIVATE
+    GG_GATEWAY_EPIC514_SERVER_MTMD=1
+    GEMMA_ENGINE_EPIC514_NPU_MTMD=1
+    GEMMA_ENGINE_EPIC514_ORT_LINKED=1
+    GEMMA_ENGINE_EPIC514_ORT_OPENMP=$<BOOL:${OpenMP_CXX_FOUND}>)
+target_include_directories(${TARGET} PRIVATE
+    "${GG_GATEWAY_ROOT}/native"
+    "${GG_GATEWAY_ROOT}/native/engine/include"
+    "${GG_GATEWAY_ROOT}/native/engine/.."
+    "${GG_GATEWAY_ORT_DIR}/include")
+target_sources(${TARGET} PRIVATE
+    "${GG_GATEWAY_ROOT}/native/engine/src/epic514_server_mtmd_hook.cpp"
+    "${GG_GATEWAY_ROOT}/native/engine/src/epic514_ort_projector.cpp")
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+if(GG_GATEWAY_ONNXRUNTIME_LIB)
+    target_link_libraries(${TARGET} PRIVATE "${GG_GATEWAY_ONNXRUNTIME_LIB}")
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+else()
+    message(FATAL_ERROR "Epic514 NPU projector requires ONNX Runtime under ${GG_GATEWAY_ORT_DIR}")
+endif()
 
 # Gemma Gateway F-005 — publish transport-free core as libllama-server-core.a (path expected by
 # scripts/ci/check_server_core_link_gate.sh). Same objects as target server-context; excludes
