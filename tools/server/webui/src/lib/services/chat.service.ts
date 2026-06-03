@@ -105,8 +105,13 @@ export class ChatService {
 				return true;
 			});
 
-		// Filter out image attachments if the model doesn't support vision
-		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
+		// Filter out image attachments only when the selected model is explicitly
+		// known to be non-vision. During startup/model-id alias churn the props
+		// cache can be missing even though the active /props endpoint advertises
+		// vision; stripping in that unknown state silently turns image prompts
+		// into text-only prompts.
+		const selectedModelModalities = options.model ? modelsStore.getModelModalities(options.model) : null;
+		if (options.model && selectedModelModalities?.vision === false) {
 			normalizedMessages.forEach((msg) => {
 				if (Array.isArray(msg.content)) {
 					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {

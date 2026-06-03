@@ -545,7 +545,8 @@ class AgenticStore {
 				];
 				for (const attachment of attachments) {
 					if (attachment.type === AttachmentType.IMAGE) {
-						if (modelsStore.modelSupportsVision(effectiveModel)) {
+						const modalities = modelsStore.getModelModalities(effectiveModel);
+						if (modalities?.vision !== false) {
 							contentParts.push({
 								type: ContentPartType.IMAGE_URL,
 								image_url: { url: (attachment as DatabaseMessageExtraImageFile).base64Url }

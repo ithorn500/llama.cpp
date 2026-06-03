@@ -1,3 +1,7 @@
+# Measure Twice, Cut Once (Mandatory)
+
+This repo follows the cross-repo agent mandate: **measure twice, cut once**. Before editing, agents must do a read-only evidence pass, define the problem and affected paths, record the design and validation plan, then make one coherent change set. No panic patching, speculative micro-fixes, or isolated edits when behavior spans components.
+
 # Instructions for llama.cpp
 
 > [!IMPORTANT]
