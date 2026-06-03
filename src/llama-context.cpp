@@ -11,6 +11,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -154,6 +155,18 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+
+    // Emergency off-switch: fused GGML_OP_GATED_DELTA_NET is fixed for HIP gfx10+ in gated_delta_net.cu (host warp vs
+    // ggml_cuda_get_physical_warp_size mismatch). Set LLAMA_DISABLE_FUSED_GDN=1 to force non-fused ops if needed.
+    {
+        const char * fgdn_env = std::getenv("LLAMA_DISABLE_FUSED_GDN");
+        if (fgdn_env && fgdn_env[0] != '\0' && std::strcmp(fgdn_env, "0") != 0) {
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+            cparams.auto_fgdn    = false;
+            LLAMA_LOG_WARN("%s: LLAMA_DISABLE_FUSED_GDN is set — fused Gated Delta Net disabled\n", __func__);
+        }
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;

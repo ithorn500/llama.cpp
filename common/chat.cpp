@@ -1425,6 +1425,44 @@ static common_chat_params common_chat_params_init_gigachat_v3(
     return data;
 }
 
+// Gemma 2/3 instruct-style templates: strict user/assistant alternation on loop_messages and Jinja
+// raise_exception when violated. The differential autoparser also tends to fail on these templates.
+// Gemma 4 is detected separately (tool_call syntax) and must not match here.
+static common_chat_params common_chat_params_init_gemma_it_start_of_turn(
+        const common_chat_template & tmpl,
+        const autoparser::templates_params & inputs) {
+    common_chat_params data;
+    autoparser::templates_params params_copy = inputs;
+    params_copy.reasoning_format             = COMMON_REASONING_FORMAT_NONE;
+    data.prompt                              = common_chat_template_direct_apply(tmpl, params_copy);
+    data.format                              = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking                   = false;
+
+    bool has_response_format =
+        !inputs.json_schema.empty() && inputs.json_schema.is_object() && !inputs.json_schema.empty();
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto end = p.end();
+        if (has_response_format) {
+            auto response_format = p.literal("```json") + p.space() +
+                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) + p.space() + p.literal("```");
+            return p.choice({ response_format, p.content(p.rest()) }) + end;
+        }
+        return p.content(p.rest()) + end;
+    });
+    data.parser = parser.save();
+
+    if (has_response_format) {
+        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+            auto schema = inputs.json_schema;
+            builder.resolve_refs(schema);
+            parser.build_grammar(builder, false);
+        });
+    }
+
+    return data;
+}
+
 namespace workaround {
 
 static void map_developer_role_to_system(json & messages) {
@@ -1484,6 +1522,44 @@ static void func_args_not_string(json & messages) {
     }
 }
 
+// Merge consecutive messages with the same role (string content only) so strict turn templates accept them.
+static void merge_consecutive_chat_roles_for_turn_templates(json & messages) {
+    if (!messages.is_array() || messages.size() < 2) {
+        return;
+    }
+    json merged = json::array();
+    for (auto & cur : messages) {
+        if (!cur.is_object() || !cur.contains("role") || !cur["role"].is_string()) {
+            merged.push_back(cur);
+            continue;
+        }
+        const std::string role = cur["role"].get<std::string>();
+        if (role == "tool") {
+            merged.push_back(cur);
+            continue;
+        }
+        if (!merged.empty() && merged.back().is_object() && merged.back().contains("role") &&
+            merged.back()["role"].is_string() && merged.back()["role"].get<std::string>() == role) {
+            auto & prev = merged.back();
+            if (prev.contains("tool_calls") || cur.contains("tool_calls")) {
+                merged.push_back(cur);
+                continue;
+            }
+            if (!prev.contains("content") || !prev["content"].is_string() || !cur.contains("content") ||
+                !cur["content"].is_string()) {
+                merged.push_back(cur);
+                continue;
+            }
+            std::string a = prev["content"].get<std::string>();
+            std::string b = cur["content"].get<std::string>();
+            prev["content"] = a.empty() ? b : (a + "\n\n" + b);
+            continue;
+        }
+        merged.push_back(cur);
+    }
+    messages = std::move(merged);
+}
+
 }
 
 static json common_chat_extra_context() {
@@ -1533,6 +1609,13 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     if (tmpl.original_caps().supports_object_arguments) {
         workaround::func_args_not_string(params.messages);
+    }
+
+    // Gemma 2/3 instruct (not Gemma 4): strict alternating turns in Jinja — merge consecutive same-role bubbles.
+    if (src.find("<start_of_turn>") != std::string::npos &&
+        src.find("Conversation roles must alternate") != std::string::npos &&
+        src.find("'<|tool_call>call:'") == std::string::npos) {
+        workaround::merge_consecutive_chat_roles_for_turn_templates(params.messages);
     }
 
     params.extra_context = common_chat_extra_context();
@@ -1606,6 +1689,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     ) {
         LOG_DBG("Using specialized template: GigaChatV3\n");
         return common_chat_params_init_gigachat_v3(tmpl, params);
+    }
+
+    // Gemma 2/3 IT — <start_of_turn> / strict alternation; autoparser often fails with Jinja raise_exception.
+    if (src.find("<start_of_turn>") != std::string::npos &&
+        src.find("Conversation roles must alternate") != std::string::npos &&
+        src.find("'<|tool_call>call:'") == std::string::npos) {
+        LOG_DBG("Using specialized template: Gemma IT (start_of_turn)\n");
+        return common_chat_params_init_gemma_it_start_of_turn(tmpl, params);
     }
 
     try {

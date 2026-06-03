@@ -1,7 +1,10 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+// PhysicalWarp must match cudaDeviceProp::warpSize from the host launch (32 on NVIDIA, typically 64 on AMD).
+// ggml_cuda_get_physical_warp_size() stays 32 on gfx10+ HIP builds for compatibility with other kernels; using it
+// here caused a host/device warp mismatch and memory corruption on gfx1150.
+template <int S_v, bool KDA, int PhysicalWarp>
+__global__ void __launch_bounds__((PhysicalWarp < S_v ? PhysicalWarp : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -42,7 +45,7 @@ gated_delta_net_cuda(const float * q,
     curr_state += state_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    constexpr int warp_size     = PhysicalWarp < S_v ? PhysicalWarp : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     float         s_shard[rows_per_lane];
@@ -145,6 +148,50 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+template <bool KDA, int PhysicalWarp>
+static void launch_gated_delta_net_for_warp(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d,
+        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1,   int64_t sq2, int64_t sq3,
+        int64_t sv1,   int64_t sv2, int64_t sv3,
+        int64_t sb1,   int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, cudaStream_t stream,
+        dim3 grid_dims, dim3 block_dims,
+        const uint3 & neqk1_magic, const uint3 & rq3_magic) {
+    switch (S_v) {
+        case 16:
+            gated_delta_net_cuda<16, KDA, PhysicalWarp><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        case 32:
+            gated_delta_net_cuda<32, KDA, PhysicalWarp><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        case 64:
+            gated_delta_net_cuda<64, KDA, PhysicalWarp><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        case 128:
+            gated_delta_net_cuda<128, KDA, PhysicalWarp><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
 template <bool KDA>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -165,38 +212,18 @@ static void launch_gated_delta_net(
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-
-    switch (S_v) {
-        case 16:
-            gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        case 32:
-            gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        case 64: {
-            gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        }
-        case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        }
-        default:
-            GGML_ABORT("fatal error");
-            break;
+    if (warp_size == 32) {
+        launch_gated_delta_net_for_warp<KDA, 32>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, stream,
+            grid_dims, block_dims, neqk1_magic, rq3_magic);
+    } else if (warp_size == 64) {
+        launch_gated_delta_net_for_warp<KDA, 64>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, stream,
+            grid_dims, block_dims, neqk1_magic, rq3_magic);
+    } else {
+        GGML_ABORT("gated_delta_net: unsupported warp_size");
     }
 }
 
