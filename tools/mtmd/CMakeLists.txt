@@ -125,3 +125,8 @@ add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
 set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+
+# The parent integration owns stripping; standalone llama.cpp is unchanged.
+if(COMMAND gemma_gateway_register_hotpath_strip)
+    gemma_gateway_register_hotpath_strip(mtmd)
+endif()
