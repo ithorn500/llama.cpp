@@ -205,8 +205,3 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
-
-# The parent integration owns stripping; standalone llama.cpp is unchanged.
-if(COMMAND gemma_gateway_register_hotpath_strip)
-    gemma_gateway_register_hotpath_strip(server-context)
-endif()

@@ -174,9 +174,3 @@ if (LLAMA_LLGUIDANCE)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
-
-# The parent integration owns stripping; standalone llama.cpp is unchanged.
-if(COMMAND gemma_gateway_register_hotpath_strip)
-    gemma_gateway_register_hotpath_strip(llama-common-base)
-    gemma_gateway_register_hotpath_strip(llama-common)
-endif()

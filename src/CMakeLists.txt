@@ -58,8 +58,3 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
-
-# The parent integration owns stripping; standalone llama.cpp is unchanged.
-if(COMMAND gemma_gateway_register_hotpath_strip)
-    gemma_gateway_register_hotpath_strip(llama)
-endif()
